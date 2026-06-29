@@ -2898,22 +2898,44 @@ impl GrepApp {
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         for (i, sug) in inc_filtered.iter().enumerate() {
                             let selected = cur_idx == Some(i);
-                            let bg = if selected { pal.bg_surface1 } else { egui::Color32::TRANSPARENT };
+                            let bg = if selected {
+                                pal.bg_surface1
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
                             let tc = if selected { pal.accent } else { pal.text };
                             let row = egui::Frame::NONE
                                 .fill(bg)
                                 .corner_radius(egui::CornerRadius::same(3))
-                                .inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 4 })
+                                .inner_margin(Margin {
+                                    left: 8,
+                                    right: 8,
+                                    top: 4,
+                                    bottom: 4,
+                                })
                                 .show(ui, |ui| {
                                     ui.set_min_width(field_w - 24.0);
-                                    ui.add(egui::Label::new(RichText::new(sug).size(12.0).color(tc)).truncate())
+                                    ui.add(
+                                        egui::Label::new(RichText::new(sug).size(12.0).color(tc))
+                                            .truncate(),
+                                    )
                                 });
-                            let rr = ui.interact(row.response.rect, egui::Id::new("inc_sug").with(i as u32), egui::Sense::click());
-                            if rr.hovered() { hov = Some(i); }
-                            if rr.clicked() { inc_sel = Some(sug.clone()); }
+                            let rr = ui.interact(
+                                row.response.rect,
+                                egui::Id::new("inc_sug").with(i as u32),
+                                egui::Sense::click(),
+                            );
+                            if rr.hovered() {
+                                hov = Some(i);
+                            }
+                            if rr.clicked() {
+                                inc_sel = Some(sug.clone());
+                            }
                         }
                     });
-                if let Some(i) = hov { self.inc_suggest_idx = Some(i); }
+                if let Some(i) = hov {
+                    self.inc_suggest_idx = Some(i);
+                }
                 if let Some(v) = inc_sel.clone() {
                     picked_inc = Some(v);
                     egui::Popup::close_id(ui.ctx(), inc_popup_id);
@@ -2950,22 +2972,44 @@ impl GrepApp {
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         for (i, sug) in exc_filtered.iter().enumerate() {
                             let selected = cur_idx == Some(i);
-                            let bg = if selected { pal.bg_surface1 } else { egui::Color32::TRANSPARENT };
+                            let bg = if selected {
+                                pal.bg_surface1
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
                             let tc = if selected { pal.accent } else { pal.text };
                             let row = egui::Frame::NONE
                                 .fill(bg)
                                 .corner_radius(egui::CornerRadius::same(3))
-                                .inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 4 })
+                                .inner_margin(Margin {
+                                    left: 8,
+                                    right: 8,
+                                    top: 4,
+                                    bottom: 4,
+                                })
                                 .show(ui, |ui| {
                                     ui.set_min_width(field_w - 24.0);
-                                    ui.add(egui::Label::new(RichText::new(sug).size(12.0).color(tc)).truncate())
+                                    ui.add(
+                                        egui::Label::new(RichText::new(sug).size(12.0).color(tc))
+                                            .truncate(),
+                                    )
                                 });
-                            let rr = ui.interact(row.response.rect, egui::Id::new("exc_sug").with(i as u32), egui::Sense::click());
-                            if rr.hovered() { hov = Some(i); }
-                            if rr.clicked() { exc_sel = Some(sug.clone()); }
+                            let rr = ui.interact(
+                                row.response.rect,
+                                egui::Id::new("exc_sug").with(i as u32),
+                                egui::Sense::click(),
+                            );
+                            if rr.hovered() {
+                                hov = Some(i);
+                            }
+                            if rr.clicked() {
+                                exc_sel = Some(sug.clone());
+                            }
                         }
                     });
-                if let Some(i) = hov { self.exc_suggest_idx = Some(i); }
+                if let Some(i) = hov {
+                    self.exc_suggest_idx = Some(i);
+                }
                 if let Some(v) = exc_sel.clone() {
                     picked_exc = Some(v);
                     egui::Popup::close_id(ui.ctx(), exc_popup_id);
@@ -6679,7 +6723,12 @@ fn show_filter_flags(
     exc_popup_id: egui::Id,
     inc_suggest_idx: &mut Option<usize>,
     exc_suggest_idx: &mut Option<usize>,
-) -> (Option<egui::Response>, Vec<String>, Option<egui::Response>, Vec<String>) {
+) -> (
+    Option<egui::Response>,
+    Vec<String>,
+    Option<egui::Response>,
+    Vec<String>,
+) {
     let row_h = ui.spacing().interact_size.y;
     let hint = |text: &str| RichText::new(text).color(pal.placeholder).italics();
 
@@ -6719,10 +6768,8 @@ fn show_filter_flags(
     if inc_resp.has_focus() {
         if inc_popup_open {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
-                *inc_suggest_idx = Some(
-                    inc_suggest_idx
-                        .map_or(0, |i| (i + 1).min(inc_n.saturating_sub(1))),
-                );
+                *inc_suggest_idx =
+                    Some(inc_suggest_idx.map_or(0, |i| (i + 1).min(inc_n.saturating_sub(1))));
             }
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
                 *inc_suggest_idx = Some(inc_suggest_idx.map_or(0, |i| i.saturating_sub(1)));
@@ -6731,8 +6778,7 @@ fn show_filter_flags(
                 egui::Popup::close_id(ui.ctx(), inc_popup_id);
                 *inc_suggest_idx = None;
             }
-        } else if ui
-            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+        } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
             && !inc_filtered.is_empty()
         {
             egui::Popup::open_id(ui.ctx(), inc_popup_id);
@@ -6785,10 +6831,8 @@ fn show_filter_flags(
     if exc_resp.has_focus() {
         if exc_popup_open {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
-                *exc_suggest_idx = Some(
-                    exc_suggest_idx
-                        .map_or(0, |i| (i + 1).min(exc_n.saturating_sub(1))),
-                );
+                *exc_suggest_idx =
+                    Some(exc_suggest_idx.map_or(0, |i| (i + 1).min(exc_n.saturating_sub(1))));
             }
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
                 *exc_suggest_idx = Some(exc_suggest_idx.map_or(0, |i| i.saturating_sub(1)));
@@ -6797,8 +6841,7 @@ fn show_filter_flags(
                 egui::Popup::close_id(ui.ctx(), exc_popup_id);
                 *exc_suggest_idx = None;
             }
-        } else if ui
-            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+        } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
             && !exc_filtered.is_empty()
         {
             egui::Popup::open_id(ui.ctx(), exc_popup_id);
