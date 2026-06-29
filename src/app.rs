@@ -2782,21 +2782,9 @@ impl GrepApp {
                 // Static "All" preset
                 {
                     let active = self.params.file_glob.is_empty();
-                    let color = if active { pal.accent } else { pal.subtext };
-                    let resp = ui
-                        .add(
-                            egui::Label::new(RichText::new("All").color(color).size(11.0))
-                                .sense(egui::Sense::click()),
-                        )
-                        .on_hover_text("Clear type filter");
-                    if resp.hovered() {
-                        ui.painter()
-                            .rect_filled(resp.rect.expand(2.0), 3.0, pal.bg_surface0);
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    if resp.clicked() {
+                    preset_chip(ui, pal, "All", active, "Clear type filter", || {
                         self.params.file_glob.clear();
-                    }
+                    });
                 }
 
                 // Dynamic presets from config
@@ -2805,21 +2793,12 @@ impl GrepApp {
                         continue;
                     }
                     let active = self.params.file_glob == preset.glob;
-                    let color = if active { pal.accent } else { pal.subtext };
-                    let resp = ui
-                        .add(
-                            egui::Label::new(RichText::new(&preset.name).color(color).size(11.0))
-                                .sense(egui::Sense::click()),
-                        )
-                        .on_hover_text(format!("Filter: {}", preset.glob));
-                    if resp.hovered() {
-                        ui.painter()
-                            .rect_filled(resp.rect.expand(2.0), 3.0, pal.bg_surface0);
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    if resp.clicked() {
-                        self.params.file_glob = preset.glob.clone();
-                    }
+                    let glob = preset.glob.clone();
+                    let name = preset.name.clone();
+                    let tooltip = format!("Filter: {glob}");
+                    preset_chip(ui, pal, &name, active, &tooltip, || {
+                        self.params.file_glob = glob.clone();
+                    });
                 }
             });
 
@@ -6920,6 +6899,45 @@ fn show_filter_flags(
     ui.spacing_mut().button_padding = saved_padding;
 
     (Some(inc_resp), inc_filtered, Some(exc_resp), exc_filtered)
+}
+
+/// Renders a Type-preset chip with correct paint order (background drawn before text).
+/// Using `painter.rect_filled()` after `ui.add(label)` would draw the rect ON TOP of
+/// the text, hiding it. This helper allocates the rect first, paints bg, then paints text.
+fn preset_chip(
+    ui: &mut Ui,
+    pal: Pal,
+    label: &str,
+    active: bool,
+    tooltip: &str,
+    on_click: impl FnOnce(),
+) {
+    let font_id = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+    let text_color = if active { pal.accent } else { pal.subtext };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font_id, text_color);
+    let padding = Vec2::new(4.0, 2.0);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + padding * 2.0, egui::Sense::click());
+    let resp = resp.on_hover_text(tooltip);
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if active || resp.hovered() {
+            let bg = if active {
+                pal.bg_surface1
+            } else {
+                pal.bg_surface0
+            };
+            painter.rect_filled(rect, 3.0, bg);
+        }
+        painter.galley(rect.min + padding, galley, text_color);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        on_click();
+    }
 }
 
 fn toolbar_frame(pal: Pal) -> egui::Frame {
