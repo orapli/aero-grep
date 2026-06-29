@@ -2124,7 +2124,7 @@ impl GrepApp {
         let max_visible = 8usize;
         let list_h = (n.min(max_visible) as f32) * item_h;
 
-        egui::Area::new(egui::Id::new("command_palette_area"))
+        egui::Area::new(egui::Id::new("command_palette_area").with(self.palette_instance))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(
                 center.x - win_w / 2.0,
