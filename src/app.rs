@@ -247,6 +247,8 @@ pub struct GrepApp {
     pat_suppress_popup_open: bool,
     dir_suggest_idx: Option<usize>,
     pat_suggest_idx: Option<usize>,
+    inc_suggest_idx: Option<usize>,
+    exc_suggest_idx: Option<usize>,
     history_filter: String,
     settings_tab: u8,
 
@@ -324,6 +326,8 @@ impl GrepApp {
             pat_suppress_popup_open: false,
             dir_suggest_idx: None,
             pat_suggest_idx: None,
+            inc_suggest_idx: None,
+            exc_suggest_idx: None,
             history_filter: String::new(),
             settings_tab: 0,
             search_scanned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2277,10 +2281,20 @@ impl GrepApp {
 
         let recent_dirs = self.recent_dirs();
         let recent_patterns = self.recent_patterns();
+        let recent_includes = self.recent_includes();
+        let recent_excludes = self.recent_excludes();
         let dir_popup_id = egui::Id::new("dir_history_popup");
         let pat_popup_id = egui::Id::new("pattern_history_popup");
+        let inc_popup_id = egui::Id::new("inc_history_popup");
+        let exc_popup_id = egui::Id::new("exc_history_popup");
         let mut picked_dir: Option<String> = None;
         let mut picked_pattern: Option<String> = None;
+        let mut inc_resp_outer: Option<egui::Response> = None;
+        let mut exc_resp_outer: Option<egui::Response> = None;
+        let mut inc_filtered: Vec<String> = vec![];
+        let mut exc_filtered: Vec<String> = vec![];
+        let mut picked_inc: Option<String> = None;
+        let mut picked_exc: Option<String> = None;
 
         // ── Row 1: Dir ────────────────────────────────────────────────
         let mut dir_resp_outer: Option<egui::Response> = None;
@@ -2737,7 +2751,25 @@ impl GrepApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
                 ui.add_space(label_w + ui.spacing().item_spacing.x);
-                show_filter_flags(ui, &mut self.params, pal, inc_id, exc_id, dir_id, pat_id);
+                let (ir, ifl, er, efl) = show_filter_flags(
+                    ui,
+                    &mut self.params,
+                    pal,
+                    inc_id,
+                    exc_id,
+                    dir_id,
+                    pat_id,
+                    &recent_includes,
+                    &recent_excludes,
+                    inc_popup_id,
+                    exc_popup_id,
+                    &mut self.inc_suggest_idx,
+                    &mut self.exc_suggest_idx,
+                );
+                inc_resp_outer = ir;
+                inc_filtered = ifl;
+                exc_resp_outer = er;
+                exc_filtered = efl;
             });
 
             // Type presets
@@ -2844,6 +2876,110 @@ impl GrepApp {
             });
         }
 
+        // Inc suggestion popup
+        let mut inc_sel: Option<String> = None;
+        if !inc_filtered.is_empty() {
+            if let Some(ref ir) = inc_resp_outer {
+                let field_w = ir.rect.width();
+                let cur_idx = self.inc_suggest_idx;
+                let mut hov: Option<usize> = None;
+                let popup_frame = egui::Frame::popup(ui.style())
+                    .fill(pal.bg_surface0)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .stroke(egui::Stroke::new(1.0, pal.bg_surface1))
+                    .inner_margin(Margin::same(4));
+                egui::Popup::from_response(ir)
+                    .id(inc_popup_id)
+                    .open_memory(None)
+                    .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+                    .frame(popup_frame)
+                    .show(|ui| {
+                        ui.set_min_width(field_w);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        for (i, sug) in inc_filtered.iter().enumerate() {
+                            let selected = cur_idx == Some(i);
+                            let bg = if selected { pal.bg_surface1 } else { egui::Color32::TRANSPARENT };
+                            let tc = if selected { pal.accent } else { pal.text };
+                            let row = egui::Frame::NONE
+                                .fill(bg)
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 4 })
+                                .show(ui, |ui| {
+                                    ui.set_min_width(field_w - 24.0);
+                                    ui.add(egui::Label::new(RichText::new(sug).size(12.0).color(tc)).truncate())
+                                });
+                            let rr = ui.interact(row.response.rect, egui::Id::new("inc_sug").with(i as u32), egui::Sense::click());
+                            if rr.hovered() { hov = Some(i); }
+                            if rr.clicked() { inc_sel = Some(sug.clone()); }
+                        }
+                    });
+                if let Some(i) = hov { self.inc_suggest_idx = Some(i); }
+                if let Some(v) = inc_sel.clone() {
+                    picked_inc = Some(v);
+                    egui::Popup::close_id(ui.ctx(), inc_popup_id);
+                    self.inc_suggest_idx = None;
+                }
+            }
+        }
+        if let Some(ref ir) = inc_resp_outer {
+            if ir.lost_focus() && inc_sel.is_none() {
+                egui::Popup::close_id(ui.ctx(), inc_popup_id);
+                self.inc_suggest_idx = None;
+            }
+        }
+
+        // Exc suggestion popup
+        let mut exc_sel: Option<String> = None;
+        if !exc_filtered.is_empty() {
+            if let Some(ref er) = exc_resp_outer {
+                let field_w = er.rect.width();
+                let cur_idx = self.exc_suggest_idx;
+                let mut hov: Option<usize> = None;
+                let popup_frame = egui::Frame::popup(ui.style())
+                    .fill(pal.bg_surface0)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .stroke(egui::Stroke::new(1.0, pal.bg_surface1))
+                    .inner_margin(Margin::same(4));
+                egui::Popup::from_response(er)
+                    .id(exc_popup_id)
+                    .open_memory(None)
+                    .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+                    .frame(popup_frame)
+                    .show(|ui| {
+                        ui.set_min_width(field_w);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        for (i, sug) in exc_filtered.iter().enumerate() {
+                            let selected = cur_idx == Some(i);
+                            let bg = if selected { pal.bg_surface1 } else { egui::Color32::TRANSPARENT };
+                            let tc = if selected { pal.accent } else { pal.text };
+                            let row = egui::Frame::NONE
+                                .fill(bg)
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 4 })
+                                .show(ui, |ui| {
+                                    ui.set_min_width(field_w - 24.0);
+                                    ui.add(egui::Label::new(RichText::new(sug).size(12.0).color(tc)).truncate())
+                                });
+                            let rr = ui.interact(row.response.rect, egui::Id::new("exc_sug").with(i as u32), egui::Sense::click());
+                            if rr.hovered() { hov = Some(i); }
+                            if rr.clicked() { exc_sel = Some(sug.clone()); }
+                        }
+                    });
+                if let Some(i) = hov { self.exc_suggest_idx = Some(i); }
+                if let Some(v) = exc_sel.clone() {
+                    picked_exc = Some(v);
+                    egui::Popup::close_id(ui.ctx(), exc_popup_id);
+                    self.exc_suggest_idx = None;
+                }
+            }
+        }
+        if let Some(ref er) = exc_resp_outer {
+            if er.lost_focus() && exc_sel.is_none() {
+                egui::Popup::close_id(ui.ctx(), exc_popup_id);
+                self.exc_suggest_idx = None;
+            }
+        }
+
         if let Some(d) = picked_dir {
             self.params.directory = d;
         }
@@ -2851,6 +2987,12 @@ impl GrepApp {
             self.params.pattern = p;
             self.focus_pattern = true;
             self.pat_suppress_popup_open = true; // suppress reopen when focus returns
+        }
+        if let Some(v) = picked_inc {
+            self.params.file_glob = v;
+        }
+        if let Some(v) = picked_exc {
+            self.params.exclude_glob = v;
         }
     }
 
@@ -2882,6 +3024,36 @@ impl GrepApp {
             }
         }
         pats
+    }
+
+    fn recent_includes(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut vals = Vec::new();
+        for entry in self.history.entries.iter().rev() {
+            let v = &entry.params.file_glob;
+            if !v.is_empty() && seen.insert(v.clone()) {
+                vals.push(v.clone());
+                if vals.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        vals
+    }
+
+    fn recent_excludes(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut vals = Vec::new();
+        for entry in self.history.entries.iter().rev() {
+            let v = &entry.params.exclude_glob;
+            if !v.is_empty() && seen.insert(v.clone()) {
+                vals.push(v.clone());
+                if vals.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        vals
     }
 
     /// Icon toggle button with tooltip (used for Settings / History / Replace).
@@ -6490,7 +6662,9 @@ fn settings_row(ui: &mut Ui, pal: Pal, label: &str, content: impl FnOnce(&mut Ui
 }
 
 /// Renders the filter+flag cluster (Inc / Exc / Regex / Case / Word / Ctx / Depth).
-/// Called from show_toolbar in either the Dir row or a separate second row.
+/// Returns (inc_resp, inc_filtered, exc_resp, exc_filtered) so the caller can render
+/// suggestion popups outside the horizontal block.
+#[allow(clippy::too_many_arguments)]
 fn show_filter_flags(
     ui: &mut Ui,
     params: &mut crate::models::SearchParams,
@@ -6499,7 +6673,13 @@ fn show_filter_flags(
     exc_id: egui::Id,
     dir_id: egui::Id,
     pat_id: egui::Id,
-) {
+    recent_includes: &[String],
+    recent_excludes: &[String],
+    inc_popup_id: egui::Id,
+    exc_popup_id: egui::Id,
+    inc_suggest_idx: &mut Option<usize>,
+    exc_suggest_idx: &mut Option<usize>,
+) -> (Option<egui::Response>, Vec<String>, Option<egui::Response>, Vec<String>) {
     let row_h = ui.spacing().interact_size.y;
     let hint = |text: &str| RichText::new(text).color(pal.placeholder).italics();
 
@@ -6511,11 +6691,61 @@ fn show_filter_flags(
             .hint_text(hint("*.rs"))
             .desired_width(300.0),
     );
+
+    let iq = params.file_glob.to_lowercase();
+    let inc_filtered: Vec<String> = recent_includes
+        .iter()
+        .filter(|v| iq.is_empty() || v.to_lowercase().contains(&iq))
+        .take(8)
+        .cloned()
+        .collect();
+
+    if inc_resp.changed() {
+        if !inc_filtered.is_empty() && inc_resp.has_focus() {
+            egui::Popup::open_id(ui.ctx(), inc_popup_id);
+        } else if inc_filtered.is_empty() {
+            egui::Popup::close_id(ui.ctx(), inc_popup_id);
+        }
+        *inc_suggest_idx = None;
+    }
+    if (inc_resp.gained_focus() || inc_resp.clicked()) && !inc_filtered.is_empty() {
+        egui::Popup::open_id(ui.ctx(), inc_popup_id);
+        *inc_suggest_idx = None;
+    }
+
+    let inc_popup_open = egui::Popup::is_id_open(ui.ctx(), inc_popup_id);
+    let inc_n = inc_filtered.len();
+
     if inc_resp.has_focus() {
+        if inc_popup_open {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                *inc_suggest_idx = Some(
+                    inc_suggest_idx
+                        .map_or(0, |i| (i + 1).min(inc_n.saturating_sub(1))),
+                );
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                *inc_suggest_idx = Some(inc_suggest_idx.map_or(0, |i| i.saturating_sub(1)));
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                egui::Popup::close_id(ui.ctx(), inc_popup_id);
+                *inc_suggest_idx = None;
+            }
+        } else if ui
+            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+            && !inc_filtered.is_empty()
+        {
+            egui::Popup::open_id(ui.ctx(), inc_popup_id);
+            *inc_suggest_idx = Some(0);
+        }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
             ui.ctx().memory_mut(|m| m.request_focus(exc_id));
+            egui::Popup::close_id(ui.ctx(), inc_popup_id);
+            *inc_suggest_idx = None;
         } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)) {
             ui.ctx().memory_mut(|m| m.request_focus(pat_id));
+            egui::Popup::close_id(ui.ctx(), inc_popup_id);
+            *inc_suggest_idx = None;
         }
     }
 
@@ -6527,11 +6757,61 @@ fn show_filter_flags(
             .hint_text(hint("node_modules,*.min.js"))
             .desired_width(300.0),
     );
+
+    let eq = params.exclude_glob.to_lowercase();
+    let exc_filtered: Vec<String> = recent_excludes
+        .iter()
+        .filter(|v| eq.is_empty() || v.to_lowercase().contains(&eq))
+        .take(8)
+        .cloned()
+        .collect();
+
+    if exc_resp.changed() {
+        if !exc_filtered.is_empty() && exc_resp.has_focus() {
+            egui::Popup::open_id(ui.ctx(), exc_popup_id);
+        } else if exc_filtered.is_empty() {
+            egui::Popup::close_id(ui.ctx(), exc_popup_id);
+        }
+        *exc_suggest_idx = None;
+    }
+    if (exc_resp.gained_focus() || exc_resp.clicked()) && !exc_filtered.is_empty() {
+        egui::Popup::open_id(ui.ctx(), exc_popup_id);
+        *exc_suggest_idx = None;
+    }
+
+    let exc_popup_open = egui::Popup::is_id_open(ui.ctx(), exc_popup_id);
+    let exc_n = exc_filtered.len();
+
     if exc_resp.has_focus() {
+        if exc_popup_open {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+                *exc_suggest_idx = Some(
+                    exc_suggest_idx
+                        .map_or(0, |i| (i + 1).min(exc_n.saturating_sub(1))),
+                );
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                *exc_suggest_idx = Some(exc_suggest_idx.map_or(0, |i| i.saturating_sub(1)));
+            }
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                egui::Popup::close_id(ui.ctx(), exc_popup_id);
+                *exc_suggest_idx = None;
+            }
+        } else if ui
+            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+            && !exc_filtered.is_empty()
+        {
+            egui::Popup::open_id(ui.ctx(), exc_popup_id);
+            *exc_suggest_idx = Some(0);
+        }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
             ui.ctx().memory_mut(|m| m.request_focus(dir_id));
+            egui::Popup::close_id(ui.ctx(), exc_popup_id);
+            *exc_suggest_idx = None;
         } else if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)) {
             ui.ctx().memory_mut(|m| m.request_focus(inc_id));
+            egui::Popup::close_id(ui.ctx(), exc_popup_id);
+            *exc_suggest_idx = None;
         }
     }
 
@@ -6595,6 +6875,8 @@ fn show_filter_flags(
     }
 
     ui.spacing_mut().button_padding = saved_padding;
+
+    (Some(inc_resp), inc_filtered, Some(exc_resp), exc_filtered)
 }
 
 fn toolbar_frame(pal: Pal) -> egui::Frame {
