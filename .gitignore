@@ -1,0 +1,12 @@
+/target/
+
+# IDE/Editor config & temp files
+.claude/
+.DS_Store
+
+# Screenshots / loose image files at repo root
+*.png
+
+# Internal dev documents
+doc/ux-backlog.md
+doc/ux-screenshots/

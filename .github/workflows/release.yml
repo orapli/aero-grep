@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-msi:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version 0.3.8 --locked
+
+      - name: Build MSI
+        run: cargo wix --nocapture
+
+      - name: Upload MSI to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/wix/aero-grep-*.msi
+          draft: false
+          generate_release_notes: true
+
+  build-macos-dmg:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (arm64)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Build (x86_64)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          lipo -create -output target/release/aero-grep \
+            target/aarch64-apple-darwin/release/aero-grep \
+            target/x86_64-apple-darwin/release/aero-grep
+
+      - name: Create .app bundle and DMG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p "aero-grep.app/Contents/MacOS"
+          cp target/release/aero-grep "aero-grep.app/Contents/MacOS/"
+          chmod +x "aero-grep.app/Contents/MacOS/aero-grep"
+          sed "s/__VERSION__/${VERSION}/" assets/macos/Info.plist \
+            > "aero-grep.app/Contents/Info.plist"
+          mkdir dmg-staging
+          cp -R "aero-grep.app" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create \
+            -volname "aero-grep ${VERSION}" \
+            -srcfolder dmg-staging \
+            -ov -format UDZO \
+            "aero-grep-${VERSION}-macos.dmg"
+
+      - name: Upload DMG to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: aero-grep-*-macos.dmg
+          generate_release_notes: false
