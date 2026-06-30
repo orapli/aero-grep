@@ -4960,6 +4960,15 @@ impl GrepApp {
                         let _ = self.config.save();
                     }
                 });
+                settings_row(ui, pal, "Search hidden files", |ui| {
+                    let r = ui.checkbox(
+                        &mut self.config.search_hidden,
+                        "Include dotfiles and hidden directories",
+                    );
+                    if r.changed() {
+                        let _ = self.config.save();
+                    }
+                });
                 settings_row(ui, pal, "Default excludes", |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.default_exclude_dirs)

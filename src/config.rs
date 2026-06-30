@@ -81,6 +81,10 @@ fn default_follow_symlinks() -> bool {
     false
 }
 
+fn default_search_hidden() -> bool {
+    true
+}
+
 fn default_preset_enabled() -> bool {
     true
 }
@@ -250,6 +254,8 @@ pub struct Config {
     pub search_encoding: String,
     #[serde(default = "default_follow_symlinks")]
     pub follow_symlinks: bool,
+    #[serde(default = "default_search_hidden")]
+    pub search_hidden: bool,
 }
 
 impl Default for Config {
@@ -282,6 +288,7 @@ impl Default for Config {
             export_omit_single_file_name: false,
             search_encoding: default_search_encoding(),
             follow_symlinks: false,
+            search_hidden: true,
         }
     }
 }

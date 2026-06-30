@@ -287,7 +287,7 @@ pub fn search(
         .git_ignore(config.respect_gitignore)
         .git_global(config.respect_gitignore)
         .git_exclude(config.respect_gitignore)
-        .hidden(false)
+        .hidden(!config.search_hidden)
         .follow_links(config.follow_symlinks)
         .threads(config.effective_threads());
     if let Some(depth) = params.max_depth {
@@ -685,6 +685,37 @@ mod tests {
             run_search(test_params(dir.path().to_str().unwrap(), "hello"), cfg).unwrap();
         assert_eq!(files.len(), 1);
         assert!(!files[0].path.to_str().unwrap().contains(".git"));
+    }
+
+    #[test]
+    fn test_search_hidden_toggle() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden")).unwrap();
+        std::fs::write(dir.path().join(".hidden").join("x.txt"), "hello\n").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "hello\n").unwrap();
+
+        // search_hidden=true (default): hidden dir included
+        let mut cfg = test_config();
+        cfg.search_hidden = true;
+        let (files, _) =
+            run_search(test_params(dir.path().to_str().unwrap(), "hello"), cfg).unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "hidden files should be included when search_hidden=true"
+        );
+
+        // search_hidden=false: hidden dir skipped
+        let mut cfg = test_config();
+        cfg.search_hidden = false;
+        let (files, _) =
+            run_search(test_params(dir.path().to_str().unwrap(), "hello"), cfg).unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "hidden files should be skipped when search_hidden=false"
+        );
+        assert!(files[0].path.to_str().unwrap().contains("visible.txt"));
     }
 
     #[test]
