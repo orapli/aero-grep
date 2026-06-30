@@ -1473,6 +1473,12 @@ impl eframe::App for GrepApp {
         let mut open_palette = false;
         let mut close_palette = false;
 
+        // A text field (search pattern, dir, filters, …) holding keyboard focus
+        // owns Enter / arrow keys. Without this guard, pressing Enter to run a
+        // search would also fire the file-list "open selected file" action when
+        // the pointer happened to hover the file list.
+        let text_input_focused = ctx.memory(|m| m.focused().is_some());
+
         ctx.input(|i| {
             let cmd = i.modifiers.command;
             let shift = i.modifiers.shift;
@@ -1516,8 +1522,10 @@ impl eframe::App for GrepApp {
                     }
                 }
 
-                // File list arrow navigation
-                if self.focused_pane == FocusedPane::FileList {
+                // File list arrow navigation. Skipped while a text field has
+                // keyboard focus so those keys edit the field (and Enter runs
+                // the search) instead of operating on the file list.
+                if self.focused_pane == FocusedPane::FileList && !text_input_focused {
                     if i.key_pressed(egui::Key::ArrowDown) {
                         next_file_req = true;
                     }
@@ -1684,6 +1692,14 @@ impl eframe::App for GrepApp {
                                         } else {
                                             pal.bg_mantle
                                         };
+                                        // Subtle outline so adjacent tabs are
+                                        // distinguishable against the strip without
+                                        // drawing much attention.
+                                        let border = if *is_active {
+                                            pal.bg_surface1
+                                        } else {
+                                            pal.bg_surface0
+                                        };
                                         let text_color =
                                             if *is_active { pal.accent } else { pal.subtext };
                                         let rounding = egui::CornerRadius {
@@ -1694,6 +1710,7 @@ impl eframe::App for GrepApp {
                                         };
                                         let frame_resp = egui::Frame::NONE
                                             .fill(bg)
+                                            .stroke(Stroke::new(1.0, border))
                                             .corner_radius(rounding)
                                             .inner_margin(Margin {
                                                 left: 8,
