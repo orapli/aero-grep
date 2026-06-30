@@ -147,6 +147,7 @@ dependencies = [
  "eframe",
  "egui",
  "glob",
+ "globset",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
