@@ -3656,17 +3656,42 @@ impl GrepApp {
                                     let icon = if is_open { "▾" } else { "▸" };
                                     ui.horizontal(|ui| {
                                         ui.add_space(indent_px);
+
+                                        // Reveal an "open in editor" button only
+                                        // while the pointer is over this row, so it
+                                        // doesn't clutter the tree at rest.
+                                        let row_top = ui.cursor().min;
+                                        let avail_w = ui.available_width();
+                                        let row_rect = egui::Rect::from_min_size(
+                                            row_top,
+                                            Vec2::new(avail_w, TREE_ROW_H),
+                                        );
+                                        let show_open = ui.rect_contains_pointer(row_rect)
+                                            && !editor_cmd.is_empty();
+                                        let label_w = if show_open {
+                                            (avail_w - 24.0).max(20.0)
+                                        } else {
+                                            avail_w
+                                        };
+
                                         let resp = ui
-                                            .add(
-                                                egui::Label::new(
-                                                    RichText::new(format!("{icon}  {name}"))
-                                                        .color(pal.subtext)
-                                                        .size(12.5),
-                                                )
-                                                .sense(egui::Sense::click())
-                                                .truncate(),
+                                            .allocate_ui_with_layout(
+                                                Vec2::new(label_w, TREE_ROW_H),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(format!("{icon}  {name}"))
+                                                                .color(pal.subtext)
+                                                                .size(12.5),
+                                                        )
+                                                        .sense(egui::Sense::click())
+                                                        .truncate(),
+                                                    )
+                                                    .on_hover_text(rel_path.as_str())
+                                                },
                                             )
-                                            .on_hover_text(rel_path.as_str());
+                                            .inner;
                                         if resp.clicked() {
                                             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                                                 &ctx, id, true,
@@ -3676,6 +3701,30 @@ impl GrepApp {
                                         }
                                         if resp.double_clicked() && !editor_cmd.is_empty() {
                                             open_req = Some(path.clone());
+                                        }
+
+                                        if show_open {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let btn = ui
+                                                        .add(
+                                                            egui::Button::new(icon_rt(
+                                                                icons::EXPORT,
+                                                                12.0,
+                                                                pal.subtext,
+                                                            ))
+                                                            .frame(false),
+                                                        )
+                                                        .on_hover_text("Open folder in editor")
+                                                        .on_hover_cursor(
+                                                            egui::CursorIcon::PointingHand,
+                                                        );
+                                                    if btn.clicked() {
+                                                        open_req = Some(path.clone());
+                                                    }
+                                                },
+                                            );
                                         }
                                     });
                                 }
@@ -6059,8 +6108,8 @@ fn file_row(
                     checkbox_toggled = true;
                 }
 
-                // Reserve fixed space for right cluster (match count only)
-                // so the filename never overlaps them.
+                // Reserve space for the match count so the filename never
+                // overlaps it, then pin the count flush to the right edge.
                 let right_reserve = 35.0_f32;
                 let name_w = (ui.available_width() - right_reserve).max(40.0);
                 let row = ui
@@ -6088,33 +6137,20 @@ fn file_row(
                     name_double_clicked = true;
                 }
 
-                ui.allocate_ui_with_layout(
-                    Vec2::new(right_reserve, row_h),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        ui.label(
-                            RichText::new(match_count.to_string())
-                                .color(pal.muted)
-                                .size(10.5),
-                        );
-                    },
-                );
+                // `right_to_left` consumes all remaining width, so the count
+                // sticks to the far-right edge regardless of the filename length.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(match_count.to_string())
+                            .color(pal.muted)
+                            .size(10.5),
+                    );
+                });
             });
         });
 
-    let mut response = resp.response;
     if let Some(hover) = hover_text {
-        response = response.on_hover_text(hover);
-    }
-
-    // Accent left bar for selected state (2px, drawn after layout)
-    if selected {
-        let r = response.rect;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(r.min, Vec2::new(2.0, r.height())),
-            CornerRadius::same(1),
-            pal.accent,
-        );
+        resp.response.on_hover_text(hover);
     }
 
     FileRowResp {
