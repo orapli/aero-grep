@@ -361,7 +361,10 @@ pub fn apply_replace(
     let content = std::fs::read_to_string(&file_match.path)
         .with_context(|| format!("Failed to read {}", file_match.path.display()))?;
     let count = regex.find_iter(&content).count();
-    Ok((regex.replace_all(&content, replace_text).into_owned(), count))
+    Ok((
+        regex.replace_all(&content, replace_text).into_owned(),
+        count,
+    ))
 }
 
 pub fn count_total_matches(files: &[FileMatch]) -> usize {
