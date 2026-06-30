@@ -3668,8 +3668,10 @@ impl GrepApp {
                                         );
                                         let show_open = ui.rect_contains_pointer(row_rect)
                                             && !editor_cmd.is_empty();
+                                        // Reserve room for the button plus a right
+                                        // margin so it clears the scrollbar.
                                         let label_w = if show_open {
-                                            (avail_w - 24.0).max(20.0)
+                                            (avail_w - 42.0).max(20.0)
                                         } else {
                                             avail_w
                                         };
@@ -3707,12 +3709,16 @@ impl GrepApp {
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
+                                                    // Right margin so the button is
+                                                    // not hidden under the scrollbar.
+                                                    ui.add_space(14.0);
                                                     let btn = ui
-                                                        .add(
+                                                        .add_sized(
+                                                            [24.0, 18.0],
                                                             egui::Button::new(icon_rt(
-                                                                icons::EXPORT,
-                                                                12.0,
-                                                                pal.subtext,
+                                                                icons::LINK_EXTERNAL,
+                                                                13.0,
+                                                                pal.accent,
                                                             ))
                                                             .frame(false),
                                                         )
@@ -6578,6 +6584,7 @@ mod icons {
     pub const COPY: &str = "\u{EBCC}"; // copy / duplicate
     pub const FOLDER: &str = "\u{EA83}"; // folder
     pub const EXPORT: &str = "\u{EBAC}"; // export
+    pub const LINK_EXTERNAL: &str = "\u{EB14}"; // open externally / in editor
     pub const ADD: &str = "\u{EA60}"; // add / plus
     pub const CLOSE: &str = "\u{EA76}"; // close / ×
     pub const PLAY: &str = "\u{EB37}"; // play / run
