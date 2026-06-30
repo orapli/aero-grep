@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::models::{FileMatch, LineMatch, MatchRange, SearchParams};
 use anyhow::{Context, Result};
 use glob::Pattern;
-use globset::{Glob, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSetBuilder};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkContext, SinkMatch};
@@ -59,7 +59,7 @@ impl IncludeMatcher {
         let mut has_path = false;
         for token in glob.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
             if token.contains('/') {
-                if let Ok(g) = Glob::new(token) {
+                if let Ok(g) = GlobBuilder::new(token).literal_separator(true).build() {
                     path_builder.add(g);
                     has_path = true;
                 }
@@ -95,18 +95,6 @@ impl IncludeMatcher {
         }
         false
     }
-}
-
-fn matches_glob(glob: &str, path: &Path) -> bool {
-    if glob.is_empty() {
-        return true;
-    }
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    glob.split(',')
-        .map(|pat| pat.trim())
-        .filter(|pat| !pat.is_empty())
-        .filter_map(|pat| Pattern::new(pat).ok())
-        .any(|p| p.matches(file_name))
 }
 
 /// Returns true if the path should be excluded by any of the comma-separated patterns.
@@ -304,11 +292,9 @@ pub fn search(
 
     let include_matcher = Arc::new(IncludeMatcher::new(&params.file_glob));
     let exclude_glob = params.exclude_glob.clone();
-    // Canonicalize roots for reliable prefix stripping when computing relative paths.
-    let roots: Vec<PathBuf> = all_roots
-        .iter()
-        .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r)))
-        .collect();
+    // Keep roots as given — the walker yields paths prefixed with exactly these roots,
+    // so strip_prefix works without any per-file syscall.
+    let roots: Vec<PathBuf> = all_roots.iter().map(PathBuf::from).collect();
     let collected: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
 
     {
@@ -358,12 +344,10 @@ pub fn search(
                     return WalkState::Continue;
                 }
                 let path = entry.path();
-                // Compute path relative to whichever search root is a prefix.
-                let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
                 let rel = roots
                     .iter()
-                    .find_map(|r| abs.strip_prefix(r).ok())
-                    .unwrap_or(&abs);
+                    .find_map(|r| path.strip_prefix(r).ok())
+                    .unwrap_or(path);
                 if is_bak_file(path)
                     || !include_matcher.matches(path, rel)
                     || is_excluded(&exclude_glob, path)
@@ -895,25 +879,6 @@ mod tests {
     }
 
     #[test]
-    fn test_matches_glob_empty_allows_all() {
-        assert!(matches_glob("", Path::new("anything.txt")));
-    }
-
-    #[test]
-    fn test_matches_glob_single_pattern() {
-        assert!(matches_glob("*.rs", Path::new("main.rs")));
-        assert!(!matches_glob("*.rs", Path::new("main.txt")));
-    }
-
-    #[test]
-    fn test_matches_glob_comma_separated() {
-        let glob = "*.js,*.ts,*.jsx,*.tsx";
-        assert!(matches_glob(glob, Path::new("app.ts")));
-        assert!(matches_glob(glob, Path::new("component.tsx")));
-        assert!(!matches_glob(glob, Path::new("main.py")));
-    }
-
-    #[test]
     fn test_include_matcher_bare_extension() {
         let m = IncludeMatcher::new("*.rs");
         // bare pattern still matches by file name anywhere
@@ -954,6 +919,13 @@ mod tests {
     fn test_include_matcher_empty_allows_all() {
         let m = IncludeMatcher::new("");
         assert!(m.matches(Path::new("/any/file.txt"), Path::new("file.txt")));
+    }
+
+    #[test]
+    fn test_include_matcher_single_star_does_not_cross_dirs() {
+        let m = IncludeMatcher::new("src/*.rs");
+        assert!(m.matches(Path::new("/p/src/a.rs"), Path::new("src/a.rs")));
+        assert!(!m.matches(Path::new("/p/src/a/b.rs"), Path::new("src/a/b.rs")));
     }
 
     #[test]
