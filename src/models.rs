@@ -76,6 +76,38 @@ impl SearchResult {
     }
 }
 
+/// Lightweight, persisted record of a past search — params and summary counts
+/// only. Deliberately does NOT hold `files` (the full match text/ranges):
+/// history can accumulate many entries, and storing full results there would
+/// bloat history.json and make every history-panel redraw clone megabytes of
+/// match text. Re-running the search (cheap; this tool is fast) recovers the
+/// full results if needed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub id: u64,
+    pub params: SearchParams,
+    pub timestamp: String,
+    pub duration_ms: u64,
+    pub total_matches: usize,
+    pub file_count: usize,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl From<&SearchResult> for HistoryEntry {
+    fn from(result: &SearchResult) -> Self {
+        Self {
+            id: result.id,
+            params: result.params.clone(),
+            timestamp: result.timestamp.clone(),
+            duration_ms: result.duration_ms,
+            total_matches: result.total_matches,
+            file_count: result.file_count(),
+            truncated: result.truncated,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ViewMode {
     Tree,

@@ -1,7 +1,9 @@
 use crate::config::{Config, Theme};
 use crate::grep::{apply_replace, build_regex, count_total_matches, search};
 use crate::history::History;
-use crate::models::{FileMatch, LineMatch, MatchRange, SearchParams, SearchResult, ViewMode};
+use crate::models::{
+    FileMatch, HistoryEntry, LineMatch, MatchRange, SearchParams, SearchResult, ViewMode,
+};
 use chrono::Local;
 use egui::{
     text::LayoutJob, Color32, CornerRadius, FontId, Margin, RichText, ScrollArea, Stroke,
@@ -757,7 +759,7 @@ impl GrepApp {
             truncated,
             files,
         };
-        self.history.push(result.clone());
+        self.history.push(HistoryEntry::from(&result));
         self.current_match = if !result.files.is_empty() && !result.files[0].matches.is_empty() {
             let idx = result.files[0]
                 .matches
@@ -1014,39 +1016,12 @@ impl GrepApp {
         }
     }
 
-    fn load_history_entry(&mut self, result: SearchResult) {
+    /// Re-run a past search from its history entry. History no longer caches
+    /// the full result set (see #15), so there is nothing to "load" instantly
+    /// — re-scanning is the only option, which is fine since search is fast.
+    fn rerun_history_entry(&mut self, entry: &HistoryEntry) {
         self.ensure_empty_tab();
-        self.params = result.params.clone();
-        self.save_active_tab();
-        self.selected_files.clear();
-        self.collapsed_files.clear();
-        self.file_filter.clear();
-        self.content_filter.clear();
-        for f in &result.files {
-            self.selected_files.insert(f.path.clone());
-        }
-        self.current_match = if !result.files.is_empty() && !result.files[0].matches.is_empty() {
-            let idx = result.files[0]
-                .matches
-                .iter()
-                .position(|m| m.is_match)
-                .unwrap_or(0);
-            Some((0, idx))
-        } else {
-            None
-        };
-        self.scroll_to_current = self.current_match.is_some();
-        self.status_msg = format!(
-            "History: {} matches in {} files",
-            result.total_matches,
-            result.file_count()
-        );
-        self.update_active_tab(result);
-    }
-
-    fn rerun_history_entry(&mut self, result: &SearchResult) {
-        self.ensure_empty_tab();
-        self.params = result.params.clone();
+        self.params = entry.params.clone();
         self.start_search();
     }
 
@@ -4662,7 +4637,6 @@ impl GrepApp {
             })
             .cloned()
             .collect();
-        let mut to_load: Option<usize> = None;
         let mut to_rerun: Option<usize> = None;
         let mut to_remove: Option<u64> = None;
 
@@ -4710,7 +4684,7 @@ impl GrepApp {
                                 ui.label(
                                     RichText::new(format!(
                                         "{} files · {} matches · {}",
-                                        entry.file_count(),
+                                        entry.file_count,
                                         entry.total_matches,
                                         format_ts(&entry.timestamp)
                                     ))
@@ -4749,20 +4723,6 @@ impl GrepApp {
                                         {
                                             to_rerun = Some(i);
                                         }
-                                        if ui
-                                            .add(
-                                                egui::Button::new(icon_rt(
-                                                    icons::HISTORY,
-                                                    14.0,
-                                                    pal.accent,
-                                                ))
-                                                .frame(false),
-                                            )
-                                            .on_hover_text("Load result")
-                                            .clicked()
-                                        {
-                                            to_load = Some(i);
-                                        }
                                     },
                                 );
                             });
@@ -4771,10 +4731,6 @@ impl GrepApp {
                 ui.add_space(8.0);
             });
 
-        if let Some(i) = to_load {
-            let e = entries[i].clone();
-            self.load_history_entry(e);
-        }
         if let Some(i) = to_rerun {
             self.rerun_history_entry(&entries[i].clone());
         }
