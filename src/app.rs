@@ -4229,6 +4229,9 @@ impl GrepApp {
         };
         scroll_area.auto_shrink([false; 2]).show(ui, |ui| {
             ui.add_space(4.0);
+            // Render rows flush against each other; the default vertical item
+            // spacing leaves a distracting blank gap between every match line.
+            ui.spacing_mut().item_spacing.y = 0.0;
             for (idx, item) in items.iter().enumerate() {
                 if Some(idx) == scroll_target_idx {
                     ui.scroll_to_cursor(Some(egui::Align::Center));
@@ -4244,6 +4247,12 @@ impl GrepApp {
                         is_collapsed,
                         match_count,
                     } => {
+                        // Separate consecutive file groups (no spacing before the
+                        // first one).
+                        if idx != 0 {
+                            ui.add_space(6.0);
+                        }
+
                         let chevron = if *is_collapsed { "▶" } else { "▼" };
 
                         // Reserve background paint slot; fill after content height is known
@@ -4262,6 +4271,7 @@ impl GrepApp {
                                 egui::Label::new(
                                     RichText::new(chevron).color(pal.muted).size(11.0),
                                 )
+                                .selectable(false)
                                 .sense(egui::Sense::click()),
                             );
                             if chevron_resp.clicked() {
@@ -4279,27 +4289,34 @@ impl GrepApp {
 
                             let display_rel = truncate_path(rel, path_max_w, 7.5);
 
-                            let path_resp = ghost_button(
-                                ui,
-                                pal,
-                                RichText::new(&display_rel)
-                                    .color(pal.text)
-                                    .monospace()
-                                    .size(13.0),
+                            // Filename is selectable text (so it can be copied);
+                            // collapsing is handled by the chevron. Double-click
+                            // still opens the file in the editor.
+                            let path_resp = ui.add(
+                                egui::Label::new(
+                                    RichText::new(&display_rel)
+                                        .color(pal.text)
+                                        .monospace()
+                                        .size(13.0),
+                                )
+                                .selectable(true)
+                                .sense(egui::Sense::click()),
                             );
                             if path_resp.double_clicked() && !editor_cmd.is_empty() {
                                 open_in_editor(&fm.path, None, &editor_cmd);
-                            } else if path_resp.clicked() {
-                                toggle_collapse = Some(fm.path.clone());
                             }
                             if display_rel != *rel {
                                 path_resp.on_hover_text(rel);
                             }
 
-                            ui.label(
-                                RichText::new(format!("  {} matches", match_count))
-                                    .color(pal.muted)
-                                    .size(11.0),
+                            // Match count: informational only, not selectable.
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("  {} matches", match_count))
+                                        .color(pal.muted)
+                                        .size(11.0),
+                                )
+                                .selectable(false),
                             );
 
                             // Always display clipboard button sticky to the right edge of visible row
@@ -6774,25 +6791,6 @@ fn truncate_path(rel: &str, max_w: f32, char_w: f32) -> String {
 // ── Ghost button helper ───────────────────────────────────────────────────────
 /// Renders a clickable label that shows a subtle hover background and pointer
 /// cursor — a "ghost" button style that doesn't look like a box at rest.
-fn ghost_button(ui: &mut Ui, pal: Pal, text: RichText) -> egui::Response {
-    let widget_text = egui::WidgetText::from(text);
-    let galley = widget_text.into_galley(ui, None, f32::INFINITY, egui::TextStyle::Body);
-    let size = galley.size();
-    let (rect, resp) = ui.allocate_exact_size(size + Vec2::new(4.0, 0.0), egui::Sense::click());
-
-    if resp.hovered() {
-        ui.painter().rect_filled(
-            rect.expand(2.0),
-            egui::CornerRadius::same(3),
-            pal.bg_surface0,
-        );
-    }
-
-    ui.painter()
-        .galley(rect.min + Vec2::new(2.0, 0.0), galley, pal.text);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
 fn preset_icon_btn(
     ui: &mut Ui,
     pal: Pal,
