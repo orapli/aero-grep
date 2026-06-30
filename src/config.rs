@@ -77,6 +77,10 @@ fn default_search_encoding() -> String {
     "auto".to_string()
 }
 
+fn default_follow_symlinks() -> bool {
+    false
+}
+
 fn default_preset_enabled() -> bool {
     true
 }
@@ -244,6 +248,8 @@ pub struct Config {
     /// encoding_rs label (e.g. "shift_jis", "euc-jp") or "auto" for BOM sniffing only.
     #[serde(default = "default_search_encoding")]
     pub search_encoding: String,
+    #[serde(default = "default_follow_symlinks")]
+    pub follow_symlinks: bool,
 }
 
 impl Default for Config {
@@ -275,6 +281,7 @@ impl Default for Config {
             export_header_enabled: default_export_header_enabled(),
             export_omit_single_file_name: false,
             search_encoding: default_search_encoding(),
+            follow_symlinks: false,
         }
     }
 }

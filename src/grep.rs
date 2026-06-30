@@ -288,7 +288,7 @@ pub fn search(
         .git_global(config.respect_gitignore)
         .git_exclude(config.respect_gitignore)
         .hidden(false)
-        .follow_links(false)
+        .follow_links(config.follow_symlinks)
         .threads(config.effective_threads());
     if let Some(depth) = params.max_depth {
         if depth > 0 {

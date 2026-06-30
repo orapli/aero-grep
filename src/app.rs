@@ -4951,6 +4951,15 @@ impl GrepApp {
                 settings_row(ui, pal, "Respect .gitignore", |ui| {
                     ui.checkbox(&mut self.config.respect_gitignore, "Skip gitignored paths");
                 });
+                settings_row(ui, pal, "Follow symlinks", |ui| {
+                    let r = ui.checkbox(
+                        &mut self.config.follow_symlinks,
+                        "Follow symbolic links (may be slower; watch for cycles)",
+                    );
+                    if r.changed() {
+                        let _ = self.config.save();
+                    }
+                });
                 settings_row(ui, pal, "Default excludes", |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.default_exclude_dirs)
