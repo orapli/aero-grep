@@ -306,7 +306,7 @@ pub fn search(
         anyhow::bail!("Search cancelled");
     }
 
-    let mut files = Arc::try_unwrap(collected).unwrap().into_inner().unwrap();
+    let mut files = std::mem::take(&mut *collected.lock().unwrap());
 
     // Enforce max result files limit
     let truncated = if config.max_result_files == 0 {
