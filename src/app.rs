@@ -192,6 +192,7 @@ struct ResultTab {
     collapsed_files: BTreeSet<PathBuf>,
     view_mode: ViewMode,
     file_filter: String,
+    content_filter: String,
     current_match: Option<(usize, usize)>,
     scroll_to_current: bool,
 }
@@ -221,6 +222,7 @@ pub struct GrepApp {
     collapsed_files: BTreeSet<PathBuf>,
     view_mode: ViewMode,
     file_filter: String,
+    content_filter: String,
 
     show_history: bool,
     show_replace: bool,
@@ -311,6 +313,7 @@ impl GrepApp {
             collapsed_files: BTreeSet::new(),
             view_mode: ViewMode::Tree,
             file_filter: String::new(),
+            content_filter: String::new(),
             show_history: false,
             show_replace: false,
             show_palette: false,
@@ -396,6 +399,7 @@ impl GrepApp {
                 tab.collapsed_files = self.collapsed_files.clone();
                 tab.view_mode = self.view_mode.clone();
                 tab.file_filter = self.file_filter.clone();
+                tab.content_filter = self.content_filter.clone();
                 tab.current_match = self.current_match;
                 tab.scroll_to_current = self.scroll_to_current;
             }
@@ -410,6 +414,7 @@ impl GrepApp {
         self.collapsed_files = tab.collapsed_files.clone();
         self.view_mode = tab.view_mode.clone();
         self.file_filter = tab.file_filter.clone();
+        self.content_filter = tab.content_filter.clone();
         self.current_match = tab.current_match;
         self.scroll_to_current = tab.scroll_to_current;
         if let Some(result) = &tab.result {
@@ -443,6 +448,7 @@ impl GrepApp {
             collapsed_files: BTreeSet::new(),
             view_mode: ViewMode::Tree,
             file_filter: String::new(),
+            content_filter: String::new(),
             current_match: None,
             scroll_to_current: false,
         };
@@ -452,6 +458,7 @@ impl GrepApp {
         self.selected_files.clear();
         self.collapsed_files.clear();
         self.file_filter.clear();
+        self.content_filter.clear();
         self.current_match = None;
         self.scroll_to_current = false;
     }
@@ -465,6 +472,7 @@ impl GrepApp {
                 tab.collapsed_files = self.collapsed_files.clone();
                 tab.view_mode = self.view_mode.clone();
                 tab.file_filter = self.file_filter.clone();
+                tab.content_filter = self.content_filter.clone();
                 tab.current_match = self.current_match;
                 tab.scroll_to_current = self.scroll_to_current;
             }
@@ -476,6 +484,7 @@ impl GrepApp {
                 collapsed_files: self.collapsed_files.clone(),
                 view_mode: self.view_mode.clone(),
                 file_filter: self.file_filter.clone(),
+                content_filter: self.content_filter.clone(),
                 current_match: self.current_match,
                 scroll_to_current: self.scroll_to_current,
             };
@@ -496,6 +505,7 @@ impl GrepApp {
             self.collapsed_files.clear();
             self.view_mode = ViewMode::Tree;
             self.file_filter.clear();
+            self.content_filter.clear();
             self.current_match = None;
             self.scroll_to_current = false;
         } else {
@@ -588,6 +598,7 @@ impl GrepApp {
             collapsed_files: BTreeSet::new(),
             view_mode: ViewMode::Tree,
             file_filter: String::new(),
+            content_filter: String::new(),
             current_match: None,
             scroll_to_current: false,
         };
@@ -598,6 +609,7 @@ impl GrepApp {
         self.selected_files.clear();
         self.collapsed_files.clear();
         self.file_filter.clear();
+        self.content_filter.clear();
         self.current_match = None;
         self.scroll_to_current = false;
     }
@@ -731,6 +743,7 @@ impl GrepApp {
         self.selected_files.clear();
         self.collapsed_files.clear();
         self.file_filter.clear();
+        self.content_filter.clear();
 
         for f in &files {
             self.selected_files.insert(f.path.clone());
@@ -1008,6 +1021,7 @@ impl GrepApp {
         self.selected_files.clear();
         self.collapsed_files.clear();
         self.file_filter.clear();
+        self.content_filter.clear();
         for f in &result.files {
             self.selected_files.insert(f.path.clone());
         }
@@ -4050,6 +4064,24 @@ impl GrepApp {
                         .on_hover_text(format!("Excluded glob filter: {}", excl));
                     }
 
+                    // Content filter input
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.content_filter)
+                            .hint_text(
+                                RichText::new("filter lines…")
+                                    .color(pal.placeholder)
+                                    .italics(),
+                            )
+                            .desired_width(140.0),
+                    );
+                    if !self.content_filter.is_empty()
+                        && ui
+                            .small_button(RichText::new("✕").color(pal.subtext))
+                            .clicked()
+                    {
+                        self.content_filter.clear();
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
                         {
@@ -4195,6 +4227,9 @@ impl GrepApp {
             Some((fm.path.clone(), lm.line_number))
         });
 
+        let content_filter_lower = self.content_filter.to_lowercase();
+        let has_content_filter = !content_filter_lower.is_empty();
+
         let mut items = Vec::new();
         for fm in &files {
             let rel = fm
@@ -4204,7 +4239,29 @@ impl GrepApp {
                 .to_string_lossy()
                 .to_string();
             let is_collapsed = self.collapsed_files.contains(&fm.path);
-            let match_count = fm.matches.iter().filter(|m| m.is_match).count();
+
+            // When a content filter is active, pre-filter to only matching lines.
+            let visible_matches: Vec<&LineMatch> = if has_content_filter {
+                fm.matches
+                    .iter()
+                    .filter(|lm| {
+                        lm.is_match && lm.content.to_lowercase().contains(&content_filter_lower)
+                    })
+                    .collect()
+            } else {
+                fm.matches.iter().collect()
+            };
+
+            // Skip files with no visible lines when filtering.
+            if has_content_filter && visible_matches.is_empty() {
+                continue;
+            }
+
+            let match_count = if has_content_filter {
+                visible_matches.len()
+            } else {
+                fm.matches.iter().filter(|m| m.is_match).count()
+            };
 
             items.push(RenderItem::FileHeader {
                 fm,
@@ -4215,7 +4272,7 @@ impl GrepApp {
 
             if !is_collapsed {
                 let mut prev_line_number: Option<usize> = None;
-                for lm in &fm.matches {
+                for lm in &visible_matches {
                     if let Some(prev) = prev_line_number {
                         if lm.line_number > prev + 1 {
                             items.push(RenderItem::GapSeparator);
