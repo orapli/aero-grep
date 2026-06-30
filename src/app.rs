@@ -202,6 +202,7 @@ enum BulkTabAction {
     All,
     Others(usize),
     ToRight(usize),
+    ToLeft(usize),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -544,6 +545,23 @@ impl GrepApp {
         self.save_active_tab();
         self.tabs.truncate(idx + 1);
         let new_active = self.active_tab.map(|ai| ai.min(idx)).unwrap_or(idx);
+        self.active_tab = None; // skip save in switch_to_tab (state already saved)
+        self.switch_to_tab(new_active);
+    }
+
+    /// Close all tabs to the left of `idx`.
+    fn close_tabs_to_left(&mut self, idx: usize) {
+        if idx == 0 || idx > self.tabs.len() {
+            return;
+        }
+        self.save_active_tab();
+        self.tabs.drain(0..idx);
+        // Tabs shift left by `idx`. If the active tab was among those removed,
+        // fall back to the now-leftmost tab (the one the menu was opened on).
+        let new_active = self
+            .active_tab
+            .map(|ai| ai.saturating_sub(idx))
+            .unwrap_or(0);
         self.active_tab = None; // skip save in switch_to_tab (state already saved)
         self.switch_to_tab(new_active);
     }
@@ -1708,6 +1726,11 @@ impl eframe::App for GrepApp {
                                             sw: 0,
                                             se: 0,
                                         };
+                                        // The whole tab is one click-sensing
+                                        // widget; inner labels are hover-only so
+                                        // they don't steal the (right-)click. The
+                                        // close "×" is hit-tested by its rect.
+                                        let mut close_rect = egui::Rect::NOTHING;
                                         let frame_resp = egui::Frame::NONE
                                             .fill(bg)
                                             .stroke(Stroke::new(1.0, border))
@@ -1734,37 +1757,46 @@ impl eframe::App for GrepApp {
                                                                         ),
                                                                     ),
                                                             )
+                                                            .selectable(false)
                                                             .sense(egui::Sense::hover()),
                                                         );
                                                     }
-                                                    let lbl = ui.add(
+                                                    ui.add(
                                                         egui::Label::new(
                                                             RichText::new(label)
                                                                 .color(text_color)
                                                                 .size(11.5),
                                                         )
-                                                        .sense(egui::Sense::click()),
+                                                        .selectable(false)
+                                                        .sense(egui::Sense::hover()),
                                                     );
-                                                    if lbl.clicked() && !is_active {
-                                                        tab_switch = Some(i);
-                                                    }
                                                     let close = ui.add(
                                                         egui::Label::new(
                                                             RichText::new("×")
                                                                 .color(pal.muted)
                                                                 .size(11.0),
                                                         )
-                                                        .sense(egui::Sense::click()),
+                                                        .selectable(false)
+                                                        .sense(egui::Sense::hover()),
                                                     );
-                                                    if close.clicked() {
-                                                        tab_close = Some(i);
-                                                    }
+                                                    close_rect = close.rect;
                                                 });
                                             });
                                         let tab_resp = frame_resp
                                             .response
+                                            .interact(egui::Sense::click())
                                             .on_hover_text(tooltip)
                                             .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        if tab_resp.clicked() {
+                                            let on_close = tab_resp
+                                                .interact_pointer_pos()
+                                                .is_some_and(|p| close_rect.contains(p));
+                                            if on_close {
+                                                tab_close = Some(i);
+                                            } else if !is_active {
+                                                tab_switch = Some(i);
+                                            }
+                                        }
                                         tab_resp.context_menu(|ui| {
                                             if ui.button("Close all").clicked() {
                                                 bulk_tab_action = Some(BulkTabAction::All);
@@ -1783,6 +1815,14 @@ impl eframe::App for GrepApp {
                                                 if ui.button("Close to the right").clicked() {
                                                     bulk_tab_action =
                                                         Some(BulkTabAction::ToRight(i));
+                                                    ui.close();
+                                                }
+                                            });
+                                            let has_left = i > 0;
+                                            ui.add_enabled_ui(has_left, |ui| {
+                                                if ui.button("Close to the left").clicked() {
+                                                    bulk_tab_action =
+                                                        Some(BulkTabAction::ToLeft(i));
                                                     ui.close();
                                                 }
                                             });
@@ -1820,6 +1860,7 @@ impl eframe::App for GrepApp {
                 BulkTabAction::All => self.close_all_tabs(),
                 BulkTabAction::Others(i) => self.close_other_tabs(i),
                 BulkTabAction::ToRight(i) => self.close_tabs_to_right(i),
+                BulkTabAction::ToLeft(i) => self.close_tabs_to_left(i),
             }
         } else if let Some(i) = tab_close {
             self.close_tab(i);
