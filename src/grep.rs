@@ -212,6 +212,7 @@ fn search_file(
     };
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(b'\x00'))
+        .bom_sniffing(true)
         .line_number(true)
         .before_context(context)
         .after_context(context)
@@ -807,6 +808,32 @@ mod tests {
             );
             assert!(content.is_char_boundary(r.end), "end is not char boundary");
         }
+    }
+
+    #[test]
+    fn test_utf16le_bom_file_is_matched() {
+        // UTF-16LE BOM + "hello world" encoded as UTF-16LE
+        let text = "hello world\n";
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // BOM
+        for c in text.encode_utf16() {
+            bytes.push(c as u8);
+            bytes.push((c >> 8) as u8);
+        }
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("utf16.txt");
+        std::fs::write(&file, &bytes).unwrap();
+        let (files, _) = run_search(
+            test_params(dir.path().to_str().unwrap(), "hello"),
+            test_config(),
+        )
+        .unwrap();
+        assert_eq!(files.len(), 1, "UTF-16LE BOM file should be matched");
+        let m = &files[0].matches[0];
+        assert!(m.is_match);
+        assert!(
+            m.content.contains("hello"),
+            "content should be readable UTF-8"
+        );
     }
 
     // ── BL-49: pure-function unit tests ───────────────────────────────────────
