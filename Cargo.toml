@@ -1,6 +1,6 @@
 [package]
 name = "aero-grep"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["orapli"]
 description = "Fast cross-project full-text search GUI"
