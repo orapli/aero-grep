@@ -760,6 +760,12 @@ impl GrepApp {
             files,
         };
         self.history.push(HistoryEntry::from(&result));
+        // Snapshot the full result to disk so "Load result" can reopen the
+        // exact original results later, even after a restart (#25). The
+        // summary entry above is unaffected if this is skipped (oversized
+        // result, no config dir, etc.) — only "Load result" stays
+        // unavailable for that entry.
+        self.history.save_result(&result);
         self.current_match = if !result.files.is_empty() && !result.files[0].matches.is_empty() {
             let idx = result.files[0]
                 .matches
@@ -1016,9 +1022,50 @@ impl GrepApp {
         }
     }
 
-    /// Re-run a past search from its history entry. History no longer caches
-    /// the full result set (see #15), so there is nothing to "load" instantly
-    /// — re-scanning is the only option, which is fine since search is fast.
+    /// Reopen a past search's exact original results from its on-disk
+    /// snapshot (#25) — instant, no re-scan, and reflects how the files
+    /// looked at the time of that search rather than however they look now.
+    /// The history panel only offers this when `History::has_result(id)` is
+    /// true; if the snapshot turns out missing/unreadable anyway (evicted,
+    /// corrupted), fail gracefully with a status message instead of
+    /// panicking.
+    fn load_history_entry(&mut self, id: u64) {
+        let Some(result) = self.history.load_result(id) else {
+            self.status_msg = "History snapshot unavailable — try Re-run instead".to_string();
+            return;
+        };
+        self.ensure_empty_tab();
+        self.params = result.params.clone();
+        self.save_active_tab();
+        self.selected_files.clear();
+        self.collapsed_files.clear();
+        self.file_filter.clear();
+        self.content_filter.clear();
+        for f in &result.files {
+            self.selected_files.insert(f.path.clone());
+        }
+        self.current_match = if !result.files.is_empty() && !result.files[0].matches.is_empty() {
+            let idx = result.files[0]
+                .matches
+                .iter()
+                .position(|m| m.is_match)
+                .unwrap_or(0);
+            Some((0, idx))
+        } else {
+            None
+        };
+        self.scroll_to_current = self.current_match.is_some();
+        self.status_msg = format!(
+            "History: {} matches in {} files",
+            result.total_matches,
+            result.file_count()
+        );
+        self.update_active_tab(result);
+    }
+
+    /// Re-run a past search from its history entry (always available,
+    /// regardless of whether a snapshot exists — re-scanning reflects the
+    /// files as they are *now*, which may differ from the snapshot).
     fn rerun_history_entry(&mut self, entry: &HistoryEntry) {
         self.ensure_empty_tab();
         self.params = entry.params.clone();
@@ -4733,6 +4780,7 @@ impl GrepApp {
             })
             .cloned()
             .collect();
+        let mut to_load: Option<u64> = None;
         let mut to_rerun: Option<usize> = None;
         let mut to_remove: Option<u64> = None;
 
@@ -4814,11 +4862,40 @@ impl GrepApp {
                                                 ))
                                                 .frame(false),
                                             )
-                                            .on_hover_text("Re-run search")
+                                            .on_hover_text(
+                                                "Re-run search (reflects files as they are now)",
+                                            )
                                             .clicked()
                                         {
                                             to_rerun = Some(i);
                                         }
+                                        // "Load result" reopens the exact original
+                                        // results from an on-disk snapshot (#25),
+                                        // instantly and without re-scanning. Only
+                                        // enabled when a snapshot actually exists
+                                        // (it may be absent: pre-#25 history,
+                                        // evicted by truncation, or skipped for
+                                        // exceeding the size cap).
+                                        let has_snapshot = self.history.has_result(entry.id);
+                                        ui.add_enabled_ui(has_snapshot, |ui| {
+                                            let load_btn = ui
+                                                .add(
+                                                    egui::Button::new(icon_rt(
+                                                        icons::HISTORY,
+                                                        14.0,
+                                                        pal.accent,
+                                                    ))
+                                                    .frame(false),
+                                                )
+                                                .on_hover_text(if has_snapshot {
+                                                    "Load result (exact original results)"
+                                                } else {
+                                                    "Snapshot unavailable — use Re-run"
+                                                });
+                                            if load_btn.clicked() {
+                                                to_load = Some(entry.id);
+                                            }
+                                        });
                                     },
                                 );
                             });
@@ -4827,6 +4904,9 @@ impl GrepApp {
                 ui.add_space(8.0);
             });
 
+        if let Some(id) = to_load {
+            self.load_history_entry(id);
+        }
         if let Some(i) = to_rerun {
             self.rerun_history_entry(&entries[i].clone());
         }
