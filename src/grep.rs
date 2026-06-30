@@ -97,23 +97,71 @@ impl IncludeMatcher {
     }
 }
 
-/// Returns true if the path should be excluded by any of the comma-separated patterns.
-/// Each token is matched against every path component (directory segment or file name).
-fn is_excluded(exclude: &str, path: &Path) -> bool {
-    if exclude.is_empty() {
-        return false;
-    }
-    let components: Vec<&str> = path
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
+/// Compiled exclude-glob matcher, built once per search from the exclude_glob string.
+struct ExcludeMatcher {
+    /// Bare patterns (no `/`): matched against every path component (backward compat).
+    component_patterns: Vec<Pattern>,
+    /// Path patterns (contain `/`): matched against path relative to search root.
+    path_globset: Option<globset::GlobSet>,
+}
 
-    exclude
-        .split(',')
-        .map(|token| token.trim())
-        .filter(|token| !token.is_empty())
-        .filter_map(|token| Pattern::new(token).ok())
-        .any(|pat| components.iter().any(|seg| pat.matches(seg)))
+impl ExcludeMatcher {
+    fn new(glob: &str) -> Self {
+        if glob.is_empty() {
+            return Self {
+                component_patterns: vec![],
+                path_globset: None,
+            };
+        }
+        let mut component_patterns = Vec::new();
+        let mut path_builder = GlobSetBuilder::new();
+        let mut has_path = false;
+        for token in glob.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            if token.contains('/') {
+                if let Ok(g) = GlobBuilder::new(token).literal_separator(true).build() {
+                    path_builder.add(g);
+                    has_path = true;
+                }
+            } else if let Ok(p) = Pattern::new(token) {
+                component_patterns.push(p);
+            }
+        }
+        let path_globset = if has_path {
+            path_builder.build().ok()
+        } else {
+            None
+        };
+        Self {
+            component_patterns,
+            path_globset,
+        }
+    }
+
+    /// Returns true if `path`/`rel` matches any exclude pattern.
+    fn is_excluded(&self, path: &Path, rel: &Path) -> bool {
+        if self.component_patterns.is_empty() && self.path_globset.is_none() {
+            return false;
+        }
+        if !self.component_patterns.is_empty() {
+            let components: Vec<&str> = path
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect();
+            if self
+                .component_patterns
+                .iter()
+                .any(|pat| components.iter().any(|seg| pat.matches(seg)))
+            {
+                return true;
+            }
+        }
+        if let Some(gs) = &self.path_globset {
+            if gs.is_match(rel) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn build_grep_matcher(params: &SearchParams) -> Result<RegexMatcher> {
@@ -297,7 +345,7 @@ pub fn search(
     }
 
     let include_matcher = Arc::new(IncludeMatcher::new(&params.file_glob));
-    let exclude_glob = params.exclude_glob.clone();
+    let exclude_matcher = Arc::new(ExcludeMatcher::new(&params.exclude_glob));
     // Keep roots as given — the walker yields paths prefixed with exactly these roots,
     // so strip_prefix works without any per-file syscall.
     let roots: Vec<PathBuf> = all_roots.iter().map(PathBuf::from).collect();
@@ -308,13 +356,14 @@ pub fn search(
         let cancel = cancel.clone();
         let excludes = excludes.clone();
         let include_matcher = include_matcher.clone();
+        let exclude_matcher = exclude_matcher.clone();
         let roots = roots.clone();
         builder.build_parallel().run(|| {
             let collected = collected.clone();
             let cancel = cancel.clone();
             let excludes = excludes.clone();
             let include_matcher = include_matcher.clone();
-            let exclude_glob = exclude_glob.clone();
+            let exclude_matcher = exclude_matcher.clone();
             let roots = roots.clone();
             Box::new(move |result| {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -356,7 +405,7 @@ pub fn search(
                     .unwrap_or(path);
                 if is_bak_file(path)
                     || !include_matcher.matches(path, rel)
-                    || is_excluded(&exclude_glob, path)
+                    || exclude_matcher.is_excluded(path, rel)
                 {
                     return WalkState::Continue;
                 }
@@ -665,6 +714,24 @@ mod tests {
         let (files, _) = run_search(p, test_config()).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].path.to_str().unwrap().ends_with("main.rs"));
+    }
+
+    #[test]
+    fn test_exclude_path_glob_filters_subdir() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("generated")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("lib")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("generated").join("x.rs"),
+            "hello\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src").join("lib").join("y.rs"), "hello\n").unwrap();
+        let mut p = test_params(dir.path().to_str().unwrap(), "hello");
+        p.exclude_glob = "src/generated/**".to_string();
+        let (files, _) = run_search(p, test_config()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.to_str().unwrap().contains("lib"));
     }
 
     #[test]
@@ -982,23 +1049,46 @@ mod tests {
     }
 
     #[test]
-    fn test_is_excluded_matches_component() {
-        assert!(is_excluded(
-            "node_modules",
-            Path::new("/project/node_modules/x.js")
+    fn test_exclude_matcher_bare_component() {
+        let m = ExcludeMatcher::new("node_modules");
+        assert!(m.is_excluded(
+            Path::new("/project/node_modules/x.js"),
+            Path::new("node_modules/x.js")
         ));
-        assert!(!is_excluded("node_modules", Path::new("/project/src/x.js")));
+        assert!(!m.is_excluded(Path::new("/project/src/x.js"), Path::new("src/x.js")));
     }
 
     #[test]
-    fn test_is_excluded_glob_pattern() {
-        assert!(is_excluded("*.min.js", Path::new("/project/app.min.js")));
-        assert!(!is_excluded("*.min.js", Path::new("/project/app.js")));
+    fn test_exclude_matcher_bare_glob() {
+        let m = ExcludeMatcher::new("*.min.js");
+        assert!(m.is_excluded(Path::new("/project/app.min.js"), Path::new("app.min.js")));
+        assert!(!m.is_excluded(Path::new("/project/app.js"), Path::new("app.js")));
     }
 
     #[test]
-    fn test_is_excluded_empty_is_false() {
-        assert!(!is_excluded("", Path::new("/project/any.rs")));
+    fn test_exclude_matcher_empty() {
+        let m = ExcludeMatcher::new("");
+        assert!(!m.is_excluded(Path::new("/project/any.rs"), Path::new("any.rs")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_path_pattern() {
+        let m = ExcludeMatcher::new("src/generated/**");
+        assert!(m.is_excluded(
+            Path::new("/proj/src/generated/x.rs"),
+            Path::new("src/generated/x.rs")
+        ));
+        assert!(!m.is_excluded(Path::new("/proj/src/main.rs"), Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn test_exclude_matcher_single_star_does_not_cross_dirs() {
+        let m = ExcludeMatcher::new("build/*.js");
+        assert!(m.is_excluded(Path::new("/proj/build/a.js"), Path::new("build/a.js")));
+        assert!(!m.is_excluded(
+            Path::new("/proj/build/sub/a.js"),
+            Path::new("build/sub/a.js")
+        ));
     }
 
     #[test]
