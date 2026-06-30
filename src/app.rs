@@ -1079,7 +1079,7 @@ impl GrepApp {
                 }
             };
             match apply_replace(fm, &regex, &params.replace_text) {
-                Ok(preview) => entries.push((fm.path.clone(), original, preview)),
+                Ok((preview, _)) => entries.push((fm.path.clone(), original, preview)),
                 Err(e) => {
                     self.status_msg = format!("Preview error: {}", e);
                     return;
@@ -1131,13 +1131,6 @@ impl GrepApp {
             let backup_root = std::path::Path::new(&config.backup_dir);
 
             for fm in &files {
-                let match_count = fm
-                    .matches
-                    .iter()
-                    .filter(|m| m.is_match)
-                    .map(|m| m.ranges.len())
-                    .sum::<usize>();
-
                 if config.backup_before_replace {
                     if let Err(e) =
                         crate::grep::backup_file_to(&fm.path, backup_root, &session_dir_name)
@@ -1149,10 +1142,10 @@ impl GrepApp {
                 }
 
                 match apply_replace(fm, &regex, &params.replace_text) {
-                    Ok(new_content) => {
+                    Ok((new_content, actual_count)) => {
                         if std::fs::write(&fm.path, new_content).is_ok() {
                             ok += 1;
-                            replaced_instances += match_count;
+                            replaced_instances += actual_count;
                         } else {
                             err += 1;
                         }

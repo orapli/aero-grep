@@ -353,10 +353,15 @@ pub fn search(
     Ok(truncated)
 }
 
-pub fn apply_replace(file_match: &FileMatch, regex: &Regex, replace_text: &str) -> Result<String> {
+pub fn apply_replace(
+    file_match: &FileMatch,
+    regex: &Regex,
+    replace_text: &str,
+) -> Result<(String, usize)> {
     let content = std::fs::read_to_string(&file_match.path)
         .with_context(|| format!("Failed to read {}", file_match.path.display()))?;
-    Ok(regex.replace_all(&content, replace_text).into_owned())
+    let count = regex.find_iter(&content).count();
+    Ok((regex.replace_all(&content, replace_text).into_owned(), count))
 }
 
 pub fn count_total_matches(files: &[FileMatch]) -> usize {
@@ -919,8 +924,30 @@ mod tests {
             path: file,
             matches: vec![],
         };
-        let result = apply_replace(&fm, &re, "bar").unwrap();
+        let (result, count) = apply_replace(&fm, &re, "bar").unwrap();
         assert_eq!(result, "let bar = 1;\nlet bar2 = 2;\n");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_apply_replace_actual_count_differs_from_snapshot() {
+        // File on disk has 3 matches; snapshot has 1 — reported count must be 3 (actual).
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("data.txt");
+        std::fs::write(&file, "foo foo foo").unwrap();
+        let re = build_regex(&SearchParams {
+            pattern: "foo".to_string(),
+            directory: dir.path().to_str().unwrap().to_string(),
+            ..SearchParams::default()
+        })
+        .unwrap();
+        let fm = FileMatch {
+            path: file,
+            matches: vec![], // snapshot intentionally empty
+        };
+        let (result, count) = apply_replace(&fm, &re, "bar").unwrap();
+        assert_eq!(result, "bar bar bar");
+        assert_eq!(count, 3);
     }
 
     #[test]
