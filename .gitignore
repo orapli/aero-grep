@@ -4,8 +4,8 @@
 .claude/
 .DS_Store
 
-# Screenshots / loose image files at repo root
-*.png
+# Screenshots / loose image files at repo root (keep tracked assets/*.png)
+/*.png
 
 # Internal dev documents
 doc/ux-backlog.md
