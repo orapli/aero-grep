@@ -609,6 +609,15 @@ impl GrepApp {
     }
 
     fn start_search(&mut self) {
+        // Ignore re-entry while a search is already running. Spawning a second
+        // worker would have it share `search_state` with the first; whichever
+        // finishes last clobbers the other's state, finalizing with the wrong
+        // (often empty) results and leaving the in-flight walk uncancellable.
+        // The Search button turns into "Stop", but Enter in the query fields
+        // would otherwise bypass that guard. Stop the current search first.
+        if matches!(*self.search_state.lock().unwrap(), SearchState::Running) {
+            return;
+        }
         self.last_search_error = None;
         if self.params.pattern.is_empty() {
             self.status_msg = "Pattern is empty".to_string();
