@@ -5,7 +5,7 @@ use glob::Pattern;
 use globset::{GlobBuilder, GlobSetBuilder};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{BinaryDetection, Encoding, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkState;
 use rayon::prelude::*;
 use regex::Regex;
@@ -198,6 +198,7 @@ fn search_file(
     matcher: &RegexMatcher,
     max_size_mb: u64,
     context: usize,
+    encoding: Option<&Encoding>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<FileMatch> {
     let metadata = std::fs::metadata(path).ok()?;
@@ -210,13 +211,17 @@ fn search_file(
         cancel,
         matches: Vec::new(),
     };
-    let mut searcher = SearcherBuilder::new()
+    let mut builder = SearcherBuilder::new();
+    builder
         .binary_detection(BinaryDetection::quit(b'\x00'))
         .bom_sniffing(true)
         .line_number(true)
         .before_context(context)
-        .after_context(context)
-        .build();
+        .after_context(context);
+    if let Some(enc) = encoding {
+        builder.encoding(Some(enc.clone()));
+    }
+    let mut searcher = builder.build();
 
     if searcher.search_path(matcher, path, &mut sink).is_err() {
         return None;
@@ -389,12 +394,25 @@ pub fn search(
 
     let max_size = config.max_file_size_mb;
     let context = params.context_lines;
+    // Build encoding once; None means auto (BOM sniffing only).
+    let encoding: Option<Encoding> = if config.search_encoding == "auto" {
+        None
+    } else {
+        Encoding::new(&config.search_encoding).ok()
+    };
     pool.install(|| {
         files.par_iter().for_each_with(tx, |sender, path| {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
-            let result = search_file(path, &matcher, max_size, context, &cancel);
+            let result = search_file(
+                path,
+                &matcher,
+                max_size,
+                context,
+                encoding.as_ref(),
+                &cancel,
+            );
             scanned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(fm) = result {
                 let h: usize = fm
@@ -834,6 +852,53 @@ mod tests {
             m.content.contains("hello"),
             "content should be readable UTF-8"
         );
+    }
+
+    #[test]
+    fn test_shift_jis_no_bom_matched_with_explicit_encoding() {
+        // "hello" in Shift-JIS (ASCII-compatible) surrounded by Shift-JIS katakana "テスト".
+        // テスト in Shift-JIS: 0x83 0x65 / 0x83 0x58 / 0x83 0x67
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&[0x83, 0x65, 0x83, 0x58, 0x83, 0x67]); // テスト
+        bytes.extend_from_slice(b" hello ");
+        bytes.extend_from_slice(&[0x83, 0x65, 0x83, 0x58, 0x83, 0x67]); // テスト
+        bytes.push(b'\n');
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("sjis.txt");
+        std::fs::write(&file, &bytes).unwrap();
+
+        let mut cfg = test_config();
+        cfg.search_encoding = "shift_jis".to_string();
+        let (files, _) =
+            run_search(test_params(dir.path().to_str().unwrap(), "hello"), cfg).unwrap();
+        assert_eq!(files.len(), 1, "Shift-JIS file should be matched");
+        let m = &files[0].matches[0];
+        assert!(m.is_match);
+        assert!(
+            m.content.contains("hello"),
+            "content should contain hello after transcoding"
+        );
+        // Verify char boundaries on all ranges.
+        for r in &m.ranges {
+            assert!(
+                m.content.is_char_boundary(r.start),
+                "start not char boundary"
+            );
+            assert!(m.content.is_char_boundary(r.end), "end not char boundary");
+        }
+    }
+
+    #[test]
+    fn test_auto_encoding_utf8_unchanged() {
+        // Default "auto" config must not break plain UTF-8 files.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello world\n").unwrap();
+        let (files, _) = run_search(
+            test_params(dir.path().to_str().unwrap(), "hello"),
+            test_config(),
+        )
+        .unwrap();
+        assert_eq!(files.len(), 1);
     }
 
     // ── BL-49: pure-function unit tests ───────────────────────────────────────

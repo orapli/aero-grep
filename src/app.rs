@@ -4921,6 +4921,33 @@ impl GrepApp {
                         );
                     });
                 }
+                settings_row(ui, pal, "Search encoding", |ui| {
+                    let options = [
+                        ("auto", "Auto (BOM sniff)"),
+                        ("UTF-8", "UTF-8"),
+                        ("shift_jis", "Shift-JIS"),
+                        ("euc-jp", "EUC-JP"),
+                        ("utf-16le", "UTF-16LE"),
+                        ("utf-16be", "UTF-16BE"),
+                        ("windows-1252", "Latin-1 (Win)"),
+                    ];
+                    let current_label = options
+                        .iter()
+                        .find(|(v, _)| *v == self.config.search_encoding)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Auto (BOM sniff)");
+                    egui::ComboBox::from_id_salt("search_encoding")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for (value, label) in &options {
+                                let selected = self.config.search_encoding == *value;
+                                if ui.selectable_label(selected, *label).clicked() {
+                                    self.config.search_encoding = value.to_string();
+                                    let _ = self.config.save();
+                                }
+                            }
+                        });
+                });
                 settings_row(ui, pal, "Respect .gitignore", |ui| {
                     ui.checkbox(&mut self.config.respect_gitignore, "Skip gitignored paths");
                 });
