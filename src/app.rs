@@ -196,6 +196,14 @@ struct ResultTab {
     scroll_to_current: bool,
 }
 
+/// Bulk tab-close action triggered from a tab's right-click context menu.
+/// The `usize` is the index of the tab the menu was opened on.
+enum BulkTabAction {
+    All,
+    Others(usize),
+    ToRight(usize),
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 pub struct GrepApp {
     params: SearchParams,
@@ -232,6 +240,11 @@ pub struct GrepApp {
     focused_pane: FocusedPane,
     current_match: Option<(usize, usize)>, // (file_index, line_match_index)
     scroll_to_current: bool,
+    /// When set, the content panel scrolls to this file's header on the next
+    /// frame (set by clicking a filename in the file list). Transient: consumed
+    /// the same frame it is set, since the file list renders before the content
+    /// panel.
+    scroll_to_file: Option<PathBuf>,
 
     pal: Pal,
     tok: Tok,
@@ -313,6 +326,7 @@ impl GrepApp {
             focused_pane: FocusedPane::FileList,
             current_match: None,
             scroll_to_current: false,
+            scroll_to_file: None,
             pal,
             tok: Tok::new(),
             applied_theme,
@@ -492,6 +506,46 @@ impl GrepApp {
             self.active_tab = None; // skip save in switch_to_tab
             self.switch_to_tab(new_idx);
         }
+    }
+
+    /// Close every tab, returning to the empty (no-tab) state — same end state
+    /// as closing the last tab one by one.
+    fn close_all_tabs(&mut self) {
+        self.tabs.clear();
+        self.active_tab = None;
+        self.current_result = None;
+        self.selected_files.clear();
+        self.collapsed_files.clear();
+        self.view_mode = ViewMode::Tree;
+        self.file_filter.clear();
+        self.current_match = None;
+        self.scroll_to_current = false;
+        self.scroll_to_file = None;
+    }
+
+    /// Close every tab except the one at `keep_idx`, which becomes active.
+    fn close_other_tabs(&mut self, keep_idx: usize) {
+        if keep_idx >= self.tabs.len() {
+            return;
+        }
+        self.save_active_tab();
+        let kept = self.tabs.remove(keep_idx);
+        self.tabs.clear();
+        self.tabs.push(kept);
+        self.active_tab = None; // skip save in switch_to_tab (state already saved)
+        self.switch_to_tab(0);
+    }
+
+    /// Close all tabs to the right of `idx`.
+    fn close_tabs_to_right(&mut self, idx: usize) {
+        if idx + 1 >= self.tabs.len() {
+            return;
+        }
+        self.save_active_tab();
+        self.tabs.truncate(idx + 1);
+        let new_active = self.active_tab.map(|ai| ai.min(idx)).unwrap_or(idx);
+        self.active_tab = None; // skip save in switch_to_tab (state already saved)
+        self.switch_to_tab(new_active);
     }
 
     fn is_settings_active(&self) -> bool {
@@ -1584,7 +1638,9 @@ impl eframe::App for GrepApp {
 
         let mut tab_switch: Option<usize> = None;
         let mut tab_close: Option<usize> = None;
+        let mut bulk_tab_action: Option<BulkTabAction> = None;
         let mut add_new_tab = false;
+        let tab_count = tabs_info.len();
 
         // History panel at global level so it spans full window height (outside tabs)
         if self.show_history {
@@ -1688,10 +1744,32 @@ impl eframe::App for GrepApp {
                                                     }
                                                 });
                                             });
-                                        frame_resp
+                                        let tab_resp = frame_resp
                                             .response
                                             .on_hover_text(tooltip)
                                             .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        tab_resp.context_menu(|ui| {
+                                            if ui.button("Close all").clicked() {
+                                                bulk_tab_action = Some(BulkTabAction::All);
+                                                ui.close();
+                                            }
+                                            let has_others = tab_count > 1;
+                                            ui.add_enabled_ui(has_others, |ui| {
+                                                if ui.button("Close others").clicked() {
+                                                    bulk_tab_action =
+                                                        Some(BulkTabAction::Others(i));
+                                                    ui.close();
+                                                }
+                                            });
+                                            let has_right = i + 1 < tab_count;
+                                            ui.add_enabled_ui(has_right, |ui| {
+                                                if ui.button("Close to the right").clicked() {
+                                                    bulk_tab_action =
+                                                        Some(BulkTabAction::ToRight(i));
+                                                    ui.close();
+                                                }
+                                            });
+                                        });
                                     }
                                     ui.add_space(4.0);
                                     if ui
@@ -1720,7 +1798,13 @@ impl eframe::App for GrepApp {
                     });
                 });
             });
-        if let Some(i) = tab_close {
+        if let Some(action) = bulk_tab_action {
+            match action {
+                BulkTabAction::All => self.close_all_tabs(),
+                BulkTabAction::Others(i) => self.close_other_tabs(i),
+                BulkTabAction::ToRight(i) => self.close_tabs_to_right(i),
+            }
+        } else if let Some(i) = tab_close {
             self.close_tab(i);
         } else if let Some(i) = tab_switch {
             self.switch_to_tab(i);
@@ -3490,7 +3574,7 @@ impl GrepApp {
         match self.view_mode {
             ViewMode::Flat => {
                 let mut open_req: Option<PathBuf> = None;
-                let row_height = 22.0;
+                let row_height = 20.0;
                 ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
                     ui,
                     row_height,
@@ -3516,10 +3600,16 @@ impl GrepApp {
                                         .to_string();
                                     let row =
                                         file_row(ui, pal, &rel, selected, *match_count, Some(&rel));
-                                    if row.clicked {
+                                    if row.checkbox_toggled {
                                         toggle_selection(&mut self.selected_files, path);
                                     }
-                                    if row.double_clicked {
+                                    if row.name_clicked {
+                                        // Clicking the filename navigates to it: ensure it's
+                                        // selected (so the content panel renders it) and scroll.
+                                        self.selected_files.insert(path.clone());
+                                        self.scroll_to_file = Some(path.clone());
+                                    }
+                                    if row.name_double_clicked {
                                         open_req = Some(path.clone());
                                     }
                                 }
@@ -3546,7 +3636,7 @@ impl GrepApp {
                 let ctx = ui.ctx().clone();
                 let flat_items = build_flat_tree(&tree_entries, &base, &ctx);
                 let mut open_req: Option<PathBuf> = None;
-                const TREE_ROW_H: f32 = 22.0;
+                const TREE_ROW_H: f32 = 20.0;
                 ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show_rows(ui, TREE_ROW_H, flat_items.len(), |ui, row_range| {
@@ -3609,13 +3699,17 @@ impl GrepApp {
                                             *match_count,
                                             Some(rel_path.as_str()),
                                         );
-                                        if row.clicked {
+                                        if row.checkbox_toggled {
                                             toggle_selection(
                                                 &mut self.selected_files,
                                                 path,
                                             );
                                         }
-                                        if row.double_clicked
+                                        if row.name_clicked {
+                                            self.selected_files.insert(path.clone());
+                                            self.scroll_to_file = Some(path.clone());
+                                        }
+                                        if row.name_double_clicked
                                             && !editor_cmd.is_empty()
                                         {
                                             open_req = Some(path.clone());
@@ -4048,6 +4142,14 @@ impl GrepApp {
             None
         };
 
+        // Scroll target for a filename click in the file list: the matching
+        // file's header row.
+        let scroll_file_target_idx = self.scroll_to_file.as_ref().and_then(|target| {
+            items.iter().position(
+                |item| matches!(item, RenderItem::FileHeader { fm, .. } if &fm.path == target),
+            )
+        });
+
         let scroll_area = if self.config.wrap_lines {
             ScrollArea::vertical()
         } else {
@@ -4059,6 +4161,9 @@ impl GrepApp {
                 if Some(idx) == scroll_target_idx {
                     ui.scroll_to_cursor(Some(egui::Align::Center));
                     clear_scroll_to_current = true;
+                }
+                if Some(idx) == scroll_file_target_idx {
+                    ui.scroll_to_cursor(Some(egui::Align::TOP));
                 }
                 match item {
                     RenderItem::FileHeader {
@@ -4299,6 +4404,10 @@ impl GrepApp {
         if clear_scroll_to_current {
             self.scroll_to_current = false;
         }
+        // One-shot: the content panel has been laid out for this frame, so any
+        // pending scroll-to-file request has been issued (or its target was not
+        // present). Either way, consume it.
+        self.scroll_to_file = None;
     }
 }
 
@@ -5906,8 +6015,12 @@ impl GrepApp {
 
 // ── File row ──────────────────────────────────────────────────────────────────
 struct FileRowResp {
-    clicked: bool,
-    double_clicked: bool,
+    /// Filename text was clicked (navigate / scroll-to-file).
+    name_clicked: bool,
+    /// Filename text was double-clicked (open in editor).
+    name_double_clicked: bool,
+    /// The selection checkbox was toggled.
+    checkbox_toggled: bool,
 }
 
 fn file_row(
@@ -5918,8 +6031,9 @@ fn file_row(
     match_count: usize,
     hover_text: Option<&str>,
 ) -> FileRowResp {
-    let mut clicked = false;
-    let mut double_clicked = false;
+    let mut name_clicked = false;
+    let mut name_double_clicked = false;
+    let mut checkbox_toggled = false;
 
     let text_color = if selected { pal.accent } else { pal.subtext };
 
@@ -5928,17 +6042,27 @@ fn file_row(
         .inner_margin(Margin {
             left: 4,
             right: 4,
-            top: 2,
-            bottom: 2,
+            top: 1,
+            bottom: 1,
         })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                let row_h = ui.spacing().interact_size.y;
+
+                // Selection checkbox (left). Toggling it manages selection,
+                // independent of clicking the filename (which navigates).
+                let mut checked = selected;
+                ui.add(egui::Checkbox::without_text(&mut checked))
+                    .on_hover_text("Select / deselect");
+                if checked != selected {
+                    checkbox_toggled = true;
+                }
+
                 // Reserve fixed space for right cluster (match count only)
                 // so the filename never overlaps them.
                 let right_reserve = 35.0_f32;
                 let name_w = (ui.available_width() - right_reserve).max(40.0);
-                let row_h = ui.spacing().interact_size.y;
                 let row = ui
                     .allocate_ui_with_layout(
                         Vec2::new(name_w, row_h),
@@ -5958,10 +6082,10 @@ fn file_row(
                     )
                     .inner;
                 if row.clicked() {
-                    clicked = true;
+                    name_clicked = true;
                 }
                 if row.double_clicked() {
-                    double_clicked = true;
+                    name_double_clicked = true;
                 }
 
                 ui.allocate_ui_with_layout(
@@ -5994,8 +6118,9 @@ fn file_row(
     }
 
     FileRowResp {
-        clicked,
-        double_clicked,
+        name_clicked,
+        name_double_clicked,
+        checkbox_toggled,
     }
 }
 
