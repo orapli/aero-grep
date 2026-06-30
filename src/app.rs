@@ -4195,6 +4195,26 @@ impl GrepApp {
             },
         }
 
+        // Fixed per-item-type heights used to virtualize this panel when
+        // word-wrap is off (see #16). Each item is rendered inside a
+        // container allocated at exactly this height, so these constants are
+        // the ground truth for layout — culling can never drift from what's
+        // painted. Chosen generously (>= natural content size): a few px of
+        // trailing blank space per row beats clipping/overlap. Word-wrap ON
+        // keeps the old natural-height, fully-rendered path (wrapped text
+        // height depends on content + width, which isn't known ahead of
+        // render without an extra text-layout pass; deferred, see report).
+        const FILE_HEADER_ROW_H: f32 = 30.0;
+        const MATCH_LINE_ROW_H: f32 = 20.0;
+        const GAP_SEPARATOR_ROW_H: f32 = 10.0;
+        fn content_item_height(item: &RenderItem<'_>) -> f32 {
+            match item {
+                RenderItem::FileHeader { .. } => FILE_HEADER_ROW_H,
+                RenderItem::GapSeparator => GAP_SEPARATOR_ROW_H,
+                RenderItem::MatchLine { .. } => MATCH_LINE_ROW_H,
+            }
+        }
+
         let current_active_line = self.current_match.and_then(|(f_idx, m_idx)| {
             let res = self.current_result.as_ref()?;
             let fm = res.files.get(f_idx)?;
@@ -4297,256 +4317,332 @@ impl GrepApp {
             )
         });
 
-        let scroll_area = if self.config.wrap_lines {
-            ScrollArea::vertical()
-        } else {
-            ScrollArea::both()
-        };
-        scroll_area.auto_shrink([false; 2]).show(ui, |ui| {
-            ui.add_space(4.0);
-            // Render rows flush against each other; the default vertical item
-            // spacing leaves a distracting blank gap between every match line.
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for (idx, item) in items.iter().enumerate() {
-                if Some(idx) == scroll_target_idx {
-                    ui.scroll_to_cursor(Some(egui::Align::Center));
-                    clear_scroll_to_current = true;
-                }
-                if Some(idx) == scroll_file_target_idx {
-                    ui.scroll_to_cursor(Some(egui::Align::TOP));
-                }
-                match item {
-                    RenderItem::FileHeader {
-                        fm,
-                        rel,
-                        is_collapsed,
-                        match_count,
-                    } => {
-                        // Separate consecutive file groups (no spacing before the
-                        // first one).
-                        if idx != 0 {
-                            ui.add_space(6.0);
-                        }
+        // Disjoint immutable borrows of `self` fields needed inside the
+        // render closure below, taken up front so the closure doesn't need
+        // `&self`/`&mut self` (which would conflict with deferred mutations
+        // applied after rendering, e.g. `toggle_collapse`).
+        let copied_file_flash = &self.copied_file_flash;
+        let config = &self.config;
 
-                        let chevron = if *is_collapsed { "▶" } else { "▼" };
+        // Renders one item into `ui`. When `forced_h` is `Some`, `ui` has
+        // been constrained to exactly that height by the caller (the
+        // virtualized/no-wrap path); the FileHeader background fill uses it
+        // instead of measuring natural content height, so the background
+        // still covers the whole allocated row.
+        let mut render_item = |ui: &mut Ui, item: &RenderItem<'_>, forced_h: Option<f32>| {
+            match item {
+                RenderItem::FileHeader {
+                    fm,
+                    rel,
+                    is_collapsed,
+                    match_count,
+                } => {
+                    // Group gap above each header (including the first one,
+                    // for a uniform per-item height — see report).
+                    ui.add_space(6.0);
 
-                        // Reserve background paint slot; fill after content height is known
-                        let bg_painter = ui.painter().clone();
-                        let bg_shape_idx = bg_painter.add(egui::Shape::Noop);
-                        let row_top = ui.cursor().top();
+                    let chevron = if *is_collapsed { "▶" } else { "▼" };
 
-                        let header_resp = ui.horizontal(|ui| {
-                            // Cap layout width to the visible area so right_to_left
-                            // sub-layout works correctly inside ScrollArea::both().
-                            ui.set_max_width(ui.clip_rect().width());
-                            ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 0.0);
-                            ui.add_space(12.0); // Left margin
+                    // Reserve background paint slot; fill after content height is known
+                    let bg_painter = ui.painter().clone();
+                    let bg_shape_idx = bg_painter.add(egui::Shape::Noop);
+                    let row_top = ui.cursor().top();
 
-                            let chevron_resp = ui.add(
-                                egui::Label::new(
-                                    RichText::new(chevron).color(pal.muted).size(11.0),
-                                )
+                    let header_resp = ui.horizontal(|ui| {
+                        // Cap layout width to the visible area so right_to_left
+                        // sub-layout works correctly inside ScrollArea::both().
+                        ui.set_max_width(ui.clip_rect().width());
+                        ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 0.0);
+                        ui.add_space(12.0); // Left margin
+
+                        let chevron_resp = ui.add(
+                            egui::Label::new(RichText::new(chevron).color(pal.muted).size(11.0))
                                 .selectable(false)
                                 .sense(egui::Sense::click()),
-                            );
-                            if chevron_resp.clicked() {
-                                toggle_collapse = Some(fm.path.clone());
-                            }
-                            chevron_resp.on_hover_text("Click to collapse/expand");
-
-                            ui.label(RichText::new("  ").size(13.0).background_color(pal.accent));
-                            ui.add_space(4.0);
-
-                            let right_reserve = 60.0_f32; // Reserve space for sticky copy button on the right
-                            let left_used = 12.0 + 16.0 + 4.0 + 8.0;
-                            let path_max_w =
-                                (ui.available_width() - right_reserve - left_used).max(60.0);
-
-                            let display_rel = truncate_path(rel, path_max_w, 7.5);
-
-                            // Filename is selectable text (so it can be copied);
-                            // collapsing is handled by the chevron. Double-click
-                            // still opens the file in the editor.
-                            let path_resp = ui.add(
-                                egui::Label::new(
-                                    RichText::new(&display_rel)
-                                        .color(pal.text)
-                                        .monospace()
-                                        .size(13.0),
-                                )
-                                .selectable(true)
-                                .sense(egui::Sense::click()),
-                            );
-                            if path_resp.double_clicked() && !editor_cmd.is_empty() {
-                                open_in_editor(&fm.path, None, &editor_cmd);
-                            }
-                            if display_rel != *rel {
-                                path_resp.on_hover_text(rel);
-                            }
-
-                            // Match count: informational only, not selectable.
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(format!("  {} matches", match_count))
-                                        .color(pal.muted)
-                                        .size(11.0),
-                                )
-                                .selectable(false),
-                            );
-
-                            // Always display clipboard button sticky to the right edge of visible row
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.add_space(8.0); // Right margin
-                                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                                    let is_active = self
-                                        .copied_file_flash
-                                        .as_ref()
-                                        .map(|(p, _)| p == &fm.path)
-                                        .unwrap_or(false);
-                                    let copy_btn =
-                                        ghost_icon_button(ui, pal, icons::COPY, is_active)
-                                            .on_hover_text("Copy all matches for this file");
-                                    if copy_btn.clicked() {
-                                        copy_text = Some(
-                                            self.format_matches_to_string(&[fm], &result.params),
-                                        );
-                                        set_copied_file = Some(fm.path.clone());
-                                    }
-                                },
-                            );
-                        });
-
-                        // Paint background spanning the full visible width at actual height
-                        bg_painter.set(
-                            bg_shape_idx,
-                            egui::Shape::rect_filled(
-                                egui::Rect::from_min_max(
-                                    egui::pos2(ui.clip_rect().min.x, row_top),
-                                    egui::pos2(
-                                        ui.clip_rect().max.x,
-                                        header_resp.response.rect.max.y,
-                                    ),
-                                ),
-                                0.0,
-                                pal.bg_mantle,
-                            ),
                         );
-                    }
-                    RenderItem::GapSeparator => {
-                        let top = ui.cursor().top();
-                        let rect = ui.available_rect_before_wrap();
-                        // Subtle 1px line aligned with the content column (after gutter)
-                        ui.painter().hline(
-                            egui::Rangef::new(rect.left() + 53.0, rect.right()),
-                            top + 4.0,
-                            Stroke::new(1.0, pal.bg_surface0),
-                        );
-                        ui.add_space(8.0);
-                    }
-                    RenderItem::MatchLine { fm, lm, is_current } => {
-                        let frame = if *is_current {
-                            egui::Frame::NONE
-                                .fill(pal.bg_surface1)
-                                .corner_radius(CornerRadius::same(3))
-                                .inner_margin(Margin {
-                                    left: 4,
-                                    right: 4,
-                                    top: 1,
-                                    bottom: 1,
-                                })
-                        } else {
-                            egui::Frame::NONE
-                        };
+                        if chevron_resp.clicked() {
+                            toggle_collapse = Some(fm.path.clone());
+                        }
+                        chevron_resp.on_hover_text("Click to collapse/expand");
 
-                        frame.show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        ui.label(RichText::new("  ").size(13.0).background_color(pal.accent));
+                        ui.add_space(4.0);
 
-                                let ln_color = if lm.is_match {
-                                    let a = pal.subtext;
-                                    let b = pal.accent;
-                                    Color32::from_rgb(
-                                        ((a.r() as u16 + b.r() as u16) / 2) as u8,
-                                        ((a.g() as u16 + b.g() as u16) / 2) as u8,
-                                        ((a.b() as u16 + b.b() as u16) / 2) as u8,
-                                    )
-                                } else {
-                                    pal.muted
-                                };
-                                let rt = RichText::new(format!(" {:>4} ", lm.line_number))
+                        let right_reserve = 60.0_f32; // Reserve space for sticky copy button on the right
+                        let left_used = 12.0 + 16.0 + 4.0 + 8.0;
+                        let path_max_w =
+                            (ui.available_width() - right_reserve - left_used).max(60.0);
+
+                        let display_rel = truncate_path(rel, path_max_w, 7.5);
+
+                        // Filename is selectable text (so it can be copied);
+                        // collapsing is handled by the chevron. Double-click
+                        // still opens the file in the editor.
+                        let path_resp = ui.add(
+                            egui::Label::new(
+                                RichText::new(&display_rel)
+                                    .color(pal.text)
                                     .monospace()
-                                    .size(12.5)
-                                    .color(ln_color);
-                                let gutter =
-                                    ui.add(egui::Label::new(rt).sense(egui::Sense::click()));
-                                if gutter.clicked() {
-                                    if lm.is_match {
-                                        set_current_match = Some((
-                                            result
-                                                .files
-                                                .iter()
-                                                .position(|f| f.path == fm.path)
-                                                .unwrap_or(0),
-                                            fm.matches
-                                                .iter()
-                                                .filter(|m| m.is_match)
-                                                .position(|m| m.line_number == lm.line_number)
-                                                .unwrap_or(0),
-                                        ));
-                                    }
-                                    if !editor_cmd.is_empty() {
-                                        open_in_editor(&fm.path, Some(lm.line_number), &editor_cmd);
-                                    }
-                                }
-                                if gutter.hovered() && lm.is_match {
-                                    let r = gutter.rect;
-                                    ui.painter().hline(
-                                        egui::Rangef::new(r.left(), r.right()),
-                                        r.bottom() - 1.0,
-                                        Stroke::new(1.0, ln_color),
-                                    );
-                                }
-                                let gutter = gutter.on_hover_cursor(egui::CursorIcon::PointingHand);
-                                gutter.on_hover_text("Click to open at this line");
+                                    .size(13.0),
+                            )
+                            .selectable(true)
+                            .sense(egui::Sense::click()),
+                        );
+                        if path_resp.double_clicked() && !editor_cmd.is_empty() {
+                            open_in_editor(&fm.path, None, &editor_cmd);
+                        }
+                        if display_rel != *rel {
+                            path_resp.on_hover_text(rel);
+                        }
 
-                                ui.add_space(4.0);
-                                let r = ui.available_rect_before_wrap();
-                                ui.painter().vline(
-                                    r.left(),
-                                    egui::Rangef::new(r.top(), r.bottom()),
-                                    Stroke::new(1.0, pal.bg_surface0),
-                                );
-                                ui.add_space(8.0);
+                        // Match count: informational only, not selectable.
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("  {} matches", match_count))
+                                    .color(pal.muted)
+                                    .size(11.0),
+                            )
+                            .selectable(false),
+                        );
 
-                                let wrap_mode = if wrap_width.is_some() {
-                                    egui::TextWrapMode::Wrap
-                                } else {
-                                    egui::TextWrapMode::Extend
-                                };
-                                if lm.is_match {
-                                    let job = build_highlighted_line(
-                                        &lm.content,
-                                        &lm.ranges,
-                                        pal,
-                                        wrap_width,
-                                    );
-                                    ui.add(
-                                        egui::Label::new(job).selectable(true).wrap_mode(wrap_mode),
-                                    );
-                                } else {
-                                    let job = build_context_line(&lm.content, pal, wrap_width);
-                                    ui.add(
-                                        egui::Label::new(job).selectable(true).wrap_mode(wrap_mode),
-                                    );
-                                }
-                            });
+                        // Always display clipboard button sticky to the right edge of visible row
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0); // Right margin
+                            ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                            let is_active = copied_file_flash
+                                .as_ref()
+                                .map(|(p, _)| p == &fm.path)
+                                .unwrap_or(false);
+                            let copy_btn = ghost_icon_button(ui, pal, icons::COPY, is_active)
+                                .on_hover_text("Copy all matches for this file");
+                            if copy_btn.clicked() {
+                                copy_text = Some(format_matches_to_string_impl(
+                                    config,
+                                    &[fm],
+                                    &result.params,
+                                ));
+                                set_copied_file = Some(fm.path.clone());
+                            }
                         });
-                    }
+                    });
+
+                    // Paint background spanning the full visible width. When
+                    // height is forced (virtualized path), use that exact
+                    // height so the fill covers the whole allocated row even
+                    // if natural content is shorter; otherwise measure it.
+                    let bg_bottom = forced_h
+                        .map(|h| row_top + h)
+                        .unwrap_or(header_resp.response.rect.max.y);
+                    bg_painter.set(
+                        bg_shape_idx,
+                        egui::Shape::rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(ui.clip_rect().min.x, row_top),
+                                egui::pos2(ui.clip_rect().max.x, bg_bottom),
+                            ),
+                            0.0,
+                            pal.bg_mantle,
+                        ),
+                    );
+                }
+                RenderItem::GapSeparator => {
+                    let top = ui.cursor().top();
+                    let rect = ui.available_rect_before_wrap();
+                    // Subtle 1px line aligned with the content column (after gutter)
+                    ui.painter().hline(
+                        egui::Rangef::new(rect.left() + 53.0, rect.right()),
+                        top + 4.0,
+                        Stroke::new(1.0, pal.bg_surface0),
+                    );
+                    ui.add_space(8.0);
+                }
+                RenderItem::MatchLine { fm, lm, is_current } => {
+                    let frame = if *is_current {
+                        egui::Frame::NONE
+                            .fill(pal.bg_surface1)
+                            .corner_radius(CornerRadius::same(3))
+                            .inner_margin(Margin {
+                                left: 4,
+                                right: 4,
+                                top: 1,
+                                bottom: 1,
+                            })
+                    } else {
+                        egui::Frame::NONE
+                    };
+
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::ZERO;
+
+                            let ln_color = if lm.is_match {
+                                let a = pal.subtext;
+                                let b = pal.accent;
+                                Color32::from_rgb(
+                                    ((a.r() as u16 + b.r() as u16) / 2) as u8,
+                                    ((a.g() as u16 + b.g() as u16) / 2) as u8,
+                                    ((a.b() as u16 + b.b() as u16) / 2) as u8,
+                                )
+                            } else {
+                                pal.muted
+                            };
+                            let rt = RichText::new(format!(" {:>4} ", lm.line_number))
+                                .monospace()
+                                .size(12.5)
+                                .color(ln_color);
+                            let gutter = ui.add(egui::Label::new(rt).sense(egui::Sense::click()));
+                            if gutter.clicked() {
+                                if lm.is_match {
+                                    set_current_match = Some((
+                                        result
+                                            .files
+                                            .iter()
+                                            .position(|f| f.path == fm.path)
+                                            .unwrap_or(0),
+                                        fm.matches
+                                            .iter()
+                                            .filter(|m| m.is_match)
+                                            .position(|m| m.line_number == lm.line_number)
+                                            .unwrap_or(0),
+                                    ));
+                                }
+                                if !editor_cmd.is_empty() {
+                                    open_in_editor(&fm.path, Some(lm.line_number), &editor_cmd);
+                                }
+                            }
+                            if gutter.hovered() && lm.is_match {
+                                let r = gutter.rect;
+                                ui.painter().hline(
+                                    egui::Rangef::new(r.left(), r.right()),
+                                    r.bottom() - 1.0,
+                                    Stroke::new(1.0, ln_color),
+                                );
+                            }
+                            let gutter = gutter.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            gutter.on_hover_text("Click to open at this line");
+
+                            ui.add_space(4.0);
+                            let r = ui.available_rect_before_wrap();
+                            ui.painter().vline(
+                                r.left(),
+                                egui::Rangef::new(r.top(), r.bottom()),
+                                Stroke::new(1.0, pal.bg_surface0),
+                            );
+                            ui.add_space(8.0);
+
+                            let wrap_mode = if wrap_width.is_some() {
+                                egui::TextWrapMode::Wrap
+                            } else {
+                                egui::TextWrapMode::Extend
+                            };
+                            if lm.is_match {
+                                let job = build_highlighted_line(
+                                    &lm.content,
+                                    &lm.ranges,
+                                    pal,
+                                    wrap_width,
+                                );
+                                ui.add(egui::Label::new(job).selectable(true).wrap_mode(wrap_mode));
+                            } else {
+                                let job = build_context_line(&lm.content, pal, wrap_width);
+                                ui.add(egui::Label::new(job).selectable(true).wrap_mode(wrap_mode));
+                            }
+                        });
+                    });
                 }
             }
-        });
+        };
+
+        if self.config.wrap_lines {
+            // Word-wrap is on: a match line's height depends on its content
+            // and the available width, which we don't know ahead of render.
+            // Fall back to the old fully-rendered path (natural heights,
+            // animated scroll-to-cursor). See #16 design note.
+            ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    // Render rows flush against each other; the default vertical
+                    // item spacing leaves a distracting blank gap between every
+                    // match line.
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (idx, item) in items.iter().enumerate() {
+                        if Some(idx) == scroll_target_idx {
+                            ui.scroll_to_cursor(Some(egui::Align::Center));
+                            clear_scroll_to_current = true;
+                        }
+                        if Some(idx) == scroll_file_target_idx {
+                            ui.scroll_to_cursor(Some(egui::Align::TOP));
+                        }
+                        render_item(ui, item, None);
+                    }
+                });
+        } else {
+            // Word-wrap is off: every item has one of three known, fixed
+            // heights (see `content_item_height`), so only the items
+            // intersecting the visible viewport (+ a small overscan) need to
+            // be rendered — the rest are represented purely by the reserved
+            // scroll height. This keeps per-frame cost roughly constant
+            // regardless of total result size (#16).
+            let heights: Vec<f32> = items.iter().map(content_item_height).collect();
+            let mut prefix = Vec::with_capacity(heights.len() + 1);
+            prefix.push(0.0_f32);
+            for h in &heights {
+                prefix.push(prefix.last().unwrap() + h);
+            }
+            let total_h = *prefix.last().unwrap_or(&0.0);
+
+            // One-shot scroll-to-target. With culling, the target item may
+            // never be rendered on the triggering frame, so the old
+            // "ui.scroll_to_cursor while rendering the target" trick can't
+            // work here. Instead, compute its offset directly from the
+            // prefix sum and force the scroll position via
+            // `vertical_scroll_offset`. This is an instant jump rather than
+            // an animated scroll (acceptable: acceptance criteria only
+            // requires it to still work, not to still animate).
+            let mut forced_offset: Option<f32> = None;
+            if let Some(idx) = scroll_target_idx {
+                let viewport_h = ui.available_height();
+                let item_top = prefix[idx];
+                let item_h = heights[idx];
+                forced_offset = Some((item_top - (viewport_h - item_h) / 2.0).max(0.0));
+                clear_scroll_to_current = true;
+            } else if let Some(idx) = scroll_file_target_idx {
+                forced_offset = Some(prefix[idx].max(0.0));
+            }
+
+            let mut scroll_area = ScrollArea::both().auto_shrink([false; 2]);
+            if let Some(y) = forced_offset {
+                scroll_area = scroll_area.vertical_scroll_offset(y);
+            }
+            scroll_area.show_viewport(ui, |ui, viewport| {
+                ui.set_height(total_h.max(0.0));
+
+                // Visible window, in item-index space, with a small overscan
+                // so fast scrolling doesn't flash blank frames.
+                const OVERSCAN: usize = 8;
+                let std::ops::Range { start, end } =
+                    visible_item_range(&prefix, viewport.min.y, viewport.max.y, OVERSCAN);
+
+                let y_min = ui.max_rect().top() + prefix[start];
+                let y_max = ui.max_rect().top() + prefix.get(end).copied().unwrap_or(total_h);
+                let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    ui.skip_ahead_auto_ids(start); // consistent widget IDs as the window shifts
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for idx in start..end {
+                        let item = &items[idx];
+                        let h = heights[idx];
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| render_item(ui, item, Some(h)),
+                        );
+                    }
+                });
+            });
+        }
 
         if let Some(path) = toggle_collapse {
             if self.collapsed_files.contains(&path) {
@@ -6856,6 +6952,38 @@ fn setup_fonts(ctx: &egui::Context, custom_font_path: &str) {
     ctx.set_fonts(fonts);
 }
 
+// ── Content panel virtualization ────────────────────────────────────────────
+/// Given cumulative row-top offsets (`prefix[i]` = top of item `i`,
+/// `prefix.len() == item_count + 1`, last entry = total content height) and a
+/// visible viewport range, returns the half-open index range of items that
+/// need to be rendered, expanded by `overscan` items on each side (clamped
+/// to the valid item range). Used to virtualize the content panel (#16):
+/// only items in the returned range are laid out, so per-frame cost stays
+/// roughly constant regardless of total item count.
+fn visible_item_range(
+    prefix: &[f32],
+    viewport_min: f32,
+    viewport_max: f32,
+    overscan: usize,
+) -> std::ops::Range<usize> {
+    let item_count = prefix.len().saturating_sub(1);
+    if item_count == 0 {
+        return 0..0;
+    }
+    let mut start = prefix
+        .partition_point(|&y| y <= viewport_min)
+        .saturating_sub(1);
+    let mut end = prefix
+        .partition_point(|&y| y < viewport_max)
+        .min(item_count);
+    start = start.saturating_sub(overscan);
+    end = (end + overscan).min(item_count);
+    if start > end {
+        start = end;
+    }
+    start..end
+}
+
 // ── Path helpers ──────────────────────────────────────────────────────────────
 /// Truncate a relative path to roughly fit `max_w` pixels given `char_w` px/char.
 /// Shows ".../<last-segment>" or ".../<parent>/<last-segment>" as needed.
@@ -7282,6 +7410,78 @@ fn format_ts(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #16: content panel virtualization windowing
+    fn uniform_prefix(item_count: usize, row_h: f32) -> Vec<f32> {
+        (0..=item_count).map(|i| i as f32 * row_h).collect()
+    }
+
+    #[test]
+    fn test_visible_item_range_large_list_stays_small() {
+        // The whole point of #16: a huge result set must not blow up the
+        // per-frame render cost. With 100k rows of height 20 and an 800px
+        // viewport, the visible window (even with overscan) should be a
+        // small constant, not anywhere near 100k.
+        let prefix = uniform_prefix(100_000, 20.0);
+        let range = visible_item_range(&prefix, 5_000.0, 5_800.0, 8);
+        // ~40 rows fit in an 800px viewport at 20px/row, plus 8 overscan on
+        // each side ≈ 56 items — nowhere near the 100k total.
+        assert!(
+            range.len() < 100,
+            "expected a small window, got {} items",
+            range.len()
+        );
+        // The window should be positioned near item 250 (5000.0 / 20.0),
+        // not at the start or end of the list.
+        assert!(range.start > 200 && range.start < 260);
+        assert!(range.end > 260 && range.end < 320);
+    }
+
+    #[test]
+    fn test_visible_item_range_at_top() {
+        let prefix = uniform_prefix(1000, 20.0);
+        let range = visible_item_range(&prefix, 0.0, 400.0, 8);
+        assert_eq!(range.start, 0); // can't overscan above index 0
+        assert!(range.end >= 20 && range.end <= 30);
+    }
+
+    #[test]
+    fn test_visible_item_range_at_bottom_clamped() {
+        let prefix = uniform_prefix(1000, 20.0);
+        let range = visible_item_range(&prefix, 19_600.0, 20_400.0, 8);
+        assert_eq!(range.end, 1000); // can't overscan past the last item
+        assert!(range.start < 1000);
+    }
+
+    #[test]
+    fn test_visible_item_range_empty_items() {
+        let prefix = vec![0.0]; // item_count = 0
+        let range = visible_item_range(&prefix, 0.0, 800.0, 8);
+        assert_eq!(range, 0..0);
+    }
+
+    #[test]
+    fn test_visible_item_range_viewport_taller_than_content() {
+        // Small result set, viewport bigger than total content: range should
+        // just be the whole list, not panic or go out of bounds.
+        let prefix = uniform_prefix(5, 20.0);
+        let range = visible_item_range(&prefix, 0.0, 800.0, 8);
+        assert_eq!(range, 0..5);
+    }
+
+    #[test]
+    fn test_visible_item_range_heterogeneous_heights() {
+        // Mixed heights (e.g. file header 30, match lines 20, gap 10) — not
+        // just the uniform case.
+        let heights = [30.0, 20.0, 20.0, 10.0, 20.0, 20.0, 30.0, 20.0];
+        let mut prefix = vec![0.0_f32];
+        for h in heights {
+            prefix.push(prefix.last().unwrap() + h);
+        }
+        // Viewport covering items 2..4 by offset (item 2 starts at 50, item 4 ends at 100)
+        let range = visible_item_range(&prefix, 50.0, 100.0, 0);
+        assert_eq!(range, 2..5);
+    }
 
     // BL-49: char-boundary helpers
     #[test]
