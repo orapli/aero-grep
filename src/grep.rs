@@ -38,6 +38,23 @@ pub fn build_regex(params: &SearchParams) -> Result<Regex> {
     Regex::new(&pattern).with_context(|| format!("Invalid regex: {}", params.pattern))
 }
 
+/// Normalizes a slashed Include/Exclude token before compiling it as a glob
+/// (#28): by default, slashed patterns now match at *any* depth (like bare
+/// tokens already do), not just root-anchored — `dir/*.ext` becomes
+/// `**/dir/*.ext`. A leading `/` opts back into the old strict
+/// root-anchored behavior (the `/` is stripped before compiling, since
+/// paths matched against are already root-relative). A token that already
+/// starts with `**/` is left as-is (idempotent — already "anywhere").
+fn normalize_path_token(token: &str) -> String {
+    if let Some(rest) = token.strip_prefix('/') {
+        rest.to_string()
+    } else if token.starts_with("**/") {
+        token.to_string()
+    } else {
+        format!("**/{token}")
+    }
+}
+
 /// Compiled include-glob matcher, built once per search from the file_glob string.
 struct IncludeMatcher {
     /// Patterns without `/`: matched against file name only (backward compat).
@@ -59,7 +76,11 @@ impl IncludeMatcher {
         let mut has_path = false;
         for token in glob.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
             if token.contains('/') {
-                if let Ok(g) = GlobBuilder::new(token).literal_separator(true).build() {
+                let normalized = normalize_path_token(token);
+                if let Ok(g) = GlobBuilder::new(&normalized)
+                    .literal_separator(true)
+                    .build()
+                {
                     path_builder.add(g);
                     has_path = true;
                 }
@@ -118,7 +139,11 @@ impl ExcludeMatcher {
         let mut has_path = false;
         for token in glob.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
             if token.contains('/') {
-                if let Ok(g) = GlobBuilder::new(token).literal_separator(true).build() {
+                let normalized = normalize_path_token(token);
+                if let Ok(g) = GlobBuilder::new(&normalized)
+                    .literal_separator(true)
+                    .build()
+                {
                     path_builder.add(g);
                     has_path = true;
                 }
@@ -1139,6 +1164,113 @@ mod tests {
         let m = IncludeMatcher::new("src/*.rs");
         assert!(m.matches(Path::new("/p/src/a.rs"), Path::new("src/a.rs")));
         assert!(!m.matches(Path::new("/p/src/a/b.rs"), Path::new("src/a/b.rs")));
+    }
+
+    // ── #28: slashed Include/Exclude tokens match at any depth by default ──
+
+    #[test]
+    fn test_normalize_path_token_bare_relative_prepends_double_star() {
+        assert_eq!(normalize_path_token("migrate/*.rb"), "**/migrate/*.rb");
+    }
+
+    #[test]
+    fn test_normalize_path_token_leading_slash_strips_and_anchors() {
+        assert_eq!(normalize_path_token("/migrate/*.rb"), "migrate/*.rb");
+    }
+
+    #[test]
+    fn test_normalize_path_token_leading_double_star_is_idempotent() {
+        assert_eq!(normalize_path_token("**/migrate/*.rb"), "**/migrate/*.rb");
+    }
+
+    #[test]
+    fn test_exclude_matcher_slashed_token_matches_any_depth_by_default() {
+        // Mirrors the issue's probe table for `migrate/*.rb`.
+        let m = ExcludeMatcher::new("migrate/*.rb");
+        assert!(
+            m.is_excluded(Path::new("/p/migrate/x.rb"), Path::new("migrate/x.rb")),
+            "root-level migrate/ should match"
+        );
+        assert!(
+            m.is_excluded(
+                Path::new("/p/db/migrate/x.rb"),
+                Path::new("db/migrate/x.rb")
+            ),
+            "nested migrate/ should now match (was the reported bug)"
+        );
+        assert!(
+            !m.is_excluded(
+                Path::new("/p/db/migrate/sub/x.rb"),
+                Path::new("db/migrate/sub/x.rb")
+            ),
+            "single-star still doesn't cross an extra directory level"
+        );
+        assert!(!m.is_excluded(
+            Path::new("/p/db/migrate/README.md"),
+            Path::new("db/migrate/README.md")
+        ));
+    }
+
+    #[test]
+    fn test_exclude_matcher_double_star_covers_nested_subdirs() {
+        let m = ExcludeMatcher::new("migrate/**/*.rb");
+        assert!(m.is_excluded(
+            Path::new("/p/db/migrate/sub/x.rb"),
+            Path::new("db/migrate/sub/x.rb")
+        ));
+    }
+
+    #[test]
+    fn test_exclude_matcher_leading_slash_restores_root_anchoring() {
+        let m = ExcludeMatcher::new("/migrate/*.rb");
+        assert!(m.is_excluded(Path::new("/p/migrate/x.rb"), Path::new("migrate/x.rb")));
+        assert!(!m.is_excluded(
+            Path::new("/p/db/migrate/x.rb"),
+            Path::new("db/migrate/x.rb")
+        ));
+    }
+
+    #[test]
+    fn test_exclude_matcher_explicit_double_star_prefix_unaffected() {
+        // Explicit **/ input and auto-prepended **/ (from the bare-relative
+        // case above) should behave identically — normalization must not
+        // double-prefix an already-anywhere pattern.
+        let explicit = ExcludeMatcher::new("**/migrate/*.rb");
+        let implicit = ExcludeMatcher::new("migrate/*.rb");
+        for (path, rel) in [
+            ("/p/migrate/x.rb", "migrate/x.rb"),
+            ("/p/db/migrate/x.rb", "db/migrate/x.rb"),
+            ("/p/db/migrate/sub/x.rb", "db/migrate/sub/x.rb"),
+        ] {
+            let p = Path::new(path);
+            let r = Path::new(rel);
+            assert_eq!(explicit.is_excluded(p, r), implicit.is_excluded(p, r));
+        }
+    }
+
+    #[test]
+    fn test_include_matcher_slashed_token_matches_any_depth_by_default() {
+        // Include behaves symmetrically to Exclude.
+        let m = IncludeMatcher::new("migrate/*.rb");
+        assert!(m.matches(Path::new("/p/migrate/x.rb"), Path::new("migrate/x.rb")));
+        assert!(m.matches(
+            Path::new("/p/db/migrate/x.rb"),
+            Path::new("db/migrate/x.rb")
+        ));
+        assert!(!m.matches(
+            Path::new("/p/db/migrate/sub/x.rb"),
+            Path::new("db/migrate/sub/x.rb")
+        ));
+    }
+
+    #[test]
+    fn test_include_matcher_leading_slash_restores_root_anchoring() {
+        let m = IncludeMatcher::new("/migrate/*.rb");
+        assert!(m.matches(Path::new("/p/migrate/x.rb"), Path::new("migrate/x.rb")));
+        assert!(!m.matches(
+            Path::new("/p/db/migrate/x.rb"),
+            Path::new("db/migrate/x.rb")
+        ));
     }
 
     #[test]

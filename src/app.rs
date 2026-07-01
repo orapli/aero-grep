@@ -5290,6 +5290,14 @@ impl GrepApp {
                                     .italics(),
                             )
                             .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text(
+                        "Directory names to always skip (comma-separated), applied on top of \
+                         the per-search Exclude field.\n\
+                         Bare directory names only (e.g. node_modules, target, *cache*) — \
+                         matched against the directory's own name and pruned at any depth. \
+                         Does NOT take file globs or dir/*.ext path patterns (use the \
+                         per-search Exclude field for those).",
                     );
                 });
             }
@@ -7400,7 +7408,13 @@ fn show_filter_flags(
     let hint = |text: &str| RichText::new(text).color(pal.placeholder).italics();
 
     ui.label(RichText::new("Include:").size(12.0))
-        .on_hover_text("Include files matching this glob (e.g. *.rs)");
+        .on_hover_text(
+            "Include files matching this glob (comma-separated).\n\
+         \u{2022} name / *.ext — matches anywhere (e.g. *.rs)\n\
+         \u{2022} dir/*.ext — matches under dir/ at any depth (e.g. src/*.rs)\n\
+         \u{2022} /dir/*.ext — anchored to the search root only\n\
+         \u{2022} ** matches any number of directories (e.g. src/**/*.rs)",
+        );
     let inc_resp = ui.add(
         egui::TextEdit::singleline(&mut params.file_glob)
             .id(inc_id)
@@ -7463,7 +7477,13 @@ fn show_filter_flags(
     }
 
     ui.label(RichText::new("Exclude:").size(12.0))
-        .on_hover_text("Exclude paths (comma-separated globs, e.g. node_modules,*.min.js)");
+        .on_hover_text(
+            "Exclude files/paths matching this glob (comma-separated).\n\
+         \u{2022} name / *.ext — matches anywhere (e.g. node_modules, *.min.js)\n\
+         \u{2022} dir/*.ext — matches under dir/ at any depth (e.g. migrate/*.rb)\n\
+         \u{2022} /dir/*.ext — anchored to the search root only\n\
+         \u{2022} ** matches any number of directories (e.g. migrate/**/*.rb)",
+        );
     let exc_resp = ui.add(
         egui::TextEdit::singleline(&mut params.exclude_glob)
             .id(exc_id)
