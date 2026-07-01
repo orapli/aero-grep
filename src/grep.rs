@@ -9,6 +9,7 @@ use grep_searcher::{BinaryDetection, Encoding, SearcherBuilder, Sink, SinkContex
 use ignore::WalkState;
 use rayon::prelude::*;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -570,6 +571,91 @@ pub fn backup_file_to(path: &Path, backup_root: &Path, session_dir_name: &str) -
     }
     std::fs::copy(path, dest_path)?;
     Ok(())
+}
+
+/// Records which files a replace session backed up, so a later restore (#22)
+/// can find and reverse it. Written once per session, alongside the backup
+/// copies under `backup_root/<timestamp>/`. `timestamp` doubles as the
+/// session directory name (it's already the `%Y%m%d-%H%M%S` format
+/// `cleanup_expired_backups` and `backup_file_to` use).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplaceSessionManifest {
+    pub timestamp: String,
+    pub pattern: String,
+    pub replace_text: String,
+    /// Original (pre-backup) absolute paths of the files this session
+    /// backed up and successfully replaced.
+    pub files: Vec<PathBuf>,
+}
+
+fn manifest_path(backup_root: &Path, session_dir_name: &str) -> PathBuf {
+    backup_root.join(session_dir_name).join("manifest.json")
+}
+
+pub fn write_session_manifest(
+    backup_root: &Path,
+    session_dir_name: &str,
+    manifest: &ReplaceSessionManifest,
+) -> Result<()> {
+    let path = manifest_path(backup_root, session_dir_name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_string_pretty(manifest)?;
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+/// Lists past replace sessions that have a manifest, newest first (session
+/// directory names sort chronologically since they're `%Y%m%d-%H%M%S`).
+/// Sessions without a manifest (e.g. pre-#22 backups, or backups made with
+/// backup-on-replace but before a crash mid-write) are silently skipped —
+/// this only surfaces sessions that can actually be restored.
+pub fn list_replace_sessions(backup_root: &Path) -> Vec<ReplaceSessionManifest> {
+    let mut sessions = Vec::new();
+    let Ok(entries) = std::fs::read_dir(backup_root) else {
+        return sessions;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(session_dir_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let manifest_path = manifest_path(backup_root, &session_dir_name);
+        if let Ok(data) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<ReplaceSessionManifest>(&data) {
+                sessions.push(manifest);
+            }
+        }
+    }
+    sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    sessions
+}
+
+/// Restores `files` from `backup_root/session_dir_name` back to their
+/// original locations, overwriting current on-disk content (#22 undo).
+/// `files` is normally a `ReplaceSessionManifest.files` subset the user
+/// picked. Returns (restored_count, error_count); a missing/unreadable
+/// backup for one file doesn't stop the rest.
+pub fn restore_from_backup(
+    backup_root: &Path,
+    session_dir_name: &str,
+    files: &[PathBuf],
+) -> (usize, usize) {
+    let session_dir = backup_root.join(session_dir_name);
+    let mut ok = 0;
+    let mut err = 0;
+    for original in files {
+        let canonical = original.canonicalize().unwrap_or_else(|_| original.clone());
+        let backup_path = session_dir.join(make_path_safe_under_dir(&canonical));
+        match std::fs::copy(&backup_path, original) {
+            Ok(_) => ok += 1,
+            Err(_) => err += 1,
+        }
+    }
+    (ok, err)
 }
 
 pub fn cleanup_expired_backups(backup_dir: &str, retention_days: usize) -> Result<()> {
@@ -1380,6 +1466,89 @@ mod tests {
         // Old directory should be deleted, fresh directory should remain
         assert!(!old_dir.exists());
         assert!(fresh_dir.exists());
+    }
+
+    // #22: replace session manifest + restore (undo)
+
+    #[test]
+    fn test_write_and_list_session_manifest() {
+        let dir = tempdir().unwrap();
+        let backup_root = dir.path().join("backups");
+        let manifest = ReplaceSessionManifest {
+            timestamp: "20260101-120000".to_string(),
+            pattern: "foo".to_string(),
+            replace_text: "bar".to_string(),
+            files: vec![PathBuf::from("/tmp/a.rs"), PathBuf::from("/tmp/b.rs")],
+        };
+        write_session_manifest(&backup_root, "20260101-120000", &manifest).unwrap();
+
+        let sessions = list_replace_sessions(&backup_root);
+        assert_eq!(sessions, vec![manifest]);
+    }
+
+    #[test]
+    fn test_list_replace_sessions_sorted_newest_first() {
+        let dir = tempdir().unwrap();
+        let backup_root = dir.path().join("backups");
+        for ts in ["20260101-000000", "20260103-000000", "20260102-000000"] {
+            let manifest = ReplaceSessionManifest {
+                timestamp: ts.to_string(),
+                pattern: "x".to_string(),
+                replace_text: "y".to_string(),
+                files: vec![],
+            };
+            write_session_manifest(&backup_root, ts, &manifest).unwrap();
+        }
+
+        let sessions = list_replace_sessions(&backup_root);
+        let timestamps: Vec<&str> = sessions.iter().map(|s| s.timestamp.as_str()).collect();
+        assert_eq!(
+            timestamps,
+            vec!["20260103-000000", "20260102-000000", "20260101-000000"]
+        );
+    }
+
+    #[test]
+    fn test_list_replace_sessions_skips_dirs_without_manifest() {
+        let dir = tempdir().unwrap();
+        let backup_root = dir.path().join("backups");
+        // A backup dir from before #22 (or from an unrelated tool) with no manifest.
+        std::fs::create_dir_all(backup_root.join("20260101-000000")).unwrap();
+        std::fs::write(
+            backup_root.join("20260101-000000").join("some_file.txt"),
+            "data",
+        )
+        .unwrap();
+
+        assert!(list_replace_sessions(&backup_root).is_empty());
+    }
+
+    #[test]
+    fn test_restore_from_backup_overwrites_current_content() {
+        let dir = tempdir().unwrap();
+        let backup_root = dir.path().join("backups");
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        backup_file_to(&file, &backup_root, "session1").unwrap();
+        std::fs::write(&file, "replaced").unwrap(); // simulate the replace that followed
+
+        let (ok, err) = restore_from_backup(&backup_root, "session1", std::slice::from_ref(&file));
+        assert_eq!((ok, err), (1, 0));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+    }
+
+    #[test]
+    fn test_restore_from_backup_counts_missing_backup_as_error() {
+        let dir = tempdir().unwrap();
+        let backup_root = dir.path().join("backups");
+        let file = dir.path().join("never_backed_up.txt");
+        std::fs::write(&file, "current").unwrap();
+
+        let (ok, err) = restore_from_backup(&backup_root, "session1", std::slice::from_ref(&file));
+        assert_eq!((ok, err), (0, 1));
+        // Restore failure must not touch the existing file.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "current");
     }
 
     #[test]

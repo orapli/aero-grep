@@ -270,6 +270,10 @@ pub struct GrepApp {
     palette_instance: u32,
     // (params_at_preview_time, [(path, original, preview)])
     replace_preview: ReplacePreview,
+    /// Files unchecked in the Replace Preview window (#22 selective
+    /// replace) — excluded from "Replace Selected". Reset whenever a new
+    /// preview is generated.
+    replace_preview_excluded: BTreeSet<PathBuf>,
 
     show_replace_confirm: bool,
     replace_confirm_files: usize,
@@ -277,6 +281,13 @@ pub struct GrepApp {
     replace_confirm_snapshot: Option<Vec<FileMatch>>,
     show_shortcuts: bool,
     show_reset_settings_confirm: bool,
+
+    // #22: restore-from-backup (undo)
+    show_restore_backups: bool,
+    restore_sessions: Vec<crate::grep::ReplaceSessionManifest>,
+    restore_selected_session: Option<usize>,
+    restore_excluded_files: BTreeSet<PathBuf>,
+    restore_status: Option<String>,
 
     focused_pane: FocusedPane,
     current_match: Option<(usize, usize)>, // (file_index, line_match_index)
@@ -377,12 +388,18 @@ impl GrepApp {
             palette_focus: false,
             palette_instance: 0,
             replace_preview: None, // (params, [(path, original, preview)])
+            replace_preview_excluded: BTreeSet::new(),
             show_replace_confirm: false,
             replace_confirm_files: 0,
             replace_confirm_matches: 0,
             replace_confirm_snapshot: None,
             show_shortcuts: false,
             show_reset_settings_confirm: false,
+            show_restore_backups: false,
+            restore_sessions: Vec::new(),
+            restore_selected_session: None,
+            restore_excluded_files: BTreeSet::new(),
+            restore_status: None,
             focused_pane: FocusedPane::FileList,
             current_match: None,
             scroll_to_current: false,
@@ -1139,6 +1156,7 @@ impl GrepApp {
             }
         }
         self.replace_preview = Some((params, entries));
+        self.replace_preview_excluded.clear();
     }
 
     fn get_files_to_replace(&self) -> Vec<FileMatch> {
@@ -1177,19 +1195,10 @@ impl GrepApp {
             return;
         };
         let params = self.params.clone();
-        let config = self.config.clone();
 
         if let Ok(regex) = build_regex(&params) {
-            let session_dir_name = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-            let backup_root = std::path::Path::new(&config.backup_dir);
-            let summary = run_replace_all(
-                &files,
-                &regex,
-                &params.replace_text,
-                config.backup_before_replace,
-                backup_root,
-                &session_dir_name,
-            );
+            let summary =
+                self.run_and_record_replace(&files, &regex, &params.pattern, &params.replace_text);
             self.status_msg = format!(
                 "Replaced {} instances in {} files ({} errors)",
                 summary.replaced_instances, summary.ok, summary.err
@@ -1197,6 +1206,40 @@ impl GrepApp {
         }
         self.replace_confirm_snapshot = None;
         self.show_replace_confirm = false;
+    }
+
+    /// Runs a Replace-All pass and, if backups are enabled and at least one
+    /// file was replaced, records a session manifest (#22) so the result
+    /// can later be found and restored via `grep::restore_from_backup`.
+    /// Shared by the toolbar Replace flow and the Preview window's
+    /// "Replace Selected" action so both are equally undo-able.
+    fn run_and_record_replace(
+        &mut self,
+        files: &[FileMatch],
+        regex: &Regex,
+        pattern: &str,
+        replace_text: &str,
+    ) -> ReplaceSummary {
+        let session_dir_name = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let backup_root = std::path::Path::new(&self.config.backup_dir).to_path_buf();
+        let summary = run_replace_all(
+            files,
+            regex,
+            replace_text,
+            self.config.backup_before_replace,
+            &backup_root,
+            &session_dir_name,
+        );
+        if self.config.backup_before_replace && !summary.replaced_files.is_empty() {
+            let manifest = crate::grep::ReplaceSessionManifest {
+                timestamp: session_dir_name.clone(),
+                pattern: pattern.to_string(),
+                replace_text: replace_text.to_string(),
+                files: summary.replaced_files.clone(),
+            };
+            let _ = crate::grep::write_session_manifest(&backup_root, &session_dir_name, &manifest);
+        }
+        summary
     }
 
     fn copy_text(&mut self, ctx: &egui::Context, text: String) {
@@ -1215,12 +1258,15 @@ impl GrepApp {
 
 /// Outcome of a `run_replace_all` pass: files rewritten successfully; files
 /// that failed (backup or write failure); total match instances actually
-/// replaced (from the real, current file content — see #7).
+/// replaced (from the real, current file content — see #7); and the
+/// original paths of the successfully-replaced files (#22), used to build
+/// a restorable session manifest when backups are enabled.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReplaceSummary {
     ok: usize,
     err: usize,
     replaced_instances: usize,
+    replaced_files: Vec<PathBuf>,
 }
 
 /// Pure orchestration of a Replace-All run over `files`: for each file,
@@ -1252,6 +1298,7 @@ fn run_replace_all(
                 if std::fs::write(&fm.path, new_content).is_ok() {
                     summary.ok += 1;
                     summary.replaced_instances += actual_count;
+                    summary.replaced_files.push(fm.path.clone());
                 } else {
                     summary.err += 1;
                 }
@@ -1570,10 +1617,12 @@ impl eframe::App for GrepApp {
             || self.show_shortcuts
             || self.replace_preview.is_some()
             || self.show_reset_settings_confirm
-            || self.show_save_project_popup;
+            || self.show_save_project_popup
+            || self.show_restore_backups;
         let enabled = !self.show_replace_confirm
             && !self.show_reset_settings_confirm
-            && !self.show_save_project_popup;
+            && !self.show_save_project_popup
+            && !self.show_restore_backups;
 
         // ── Global keyboard shortcuts ──────────────────────────────────────────
         let mut next_match_req = false;
@@ -1617,6 +1666,7 @@ impl eframe::App for GrepApp {
                     self.replace_confirm_snapshot = None;
                     self.show_reset_settings_confirm = false;
                     self.show_save_project_popup = false;
+                    self.show_restore_backups = false;
                     if self.replace_preview.is_some() {
                         self.replace_preview = None;
                     } else if self.is_settings_active() {
@@ -2164,6 +2214,20 @@ impl eframe::App for GrepApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(&ctx, |ui| {
                     self.show_save_project_window(ui);
+                });
+        }
+
+        if self.show_restore_backups {
+            egui::Window::new("Restore from Backup")
+                .collapsible(false)
+                .resizable(true)
+                .vscroll(true)
+                .default_size([480.0, 420.0])
+                .max_width(max_w)
+                .max_height(max_h)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    self.show_restore_backups_window(ui);
                 });
         }
 
@@ -5484,6 +5548,20 @@ impl GrepApp {
                         );
                     }
                 });
+                settings_row(ui, pal, "Restore from backup", |ui| {
+                    if ui
+                        .button(RichText::new("Restore…").size(12.0))
+                        .on_hover_text("Undo a past replace session from its backup")
+                        .clicked()
+                    {
+                        self.restore_sessions =
+                            crate::grep::list_replace_sessions(Path::new(&self.config.backup_dir));
+                        self.restore_selected_session = None;
+                        self.restore_excluded_files.clear();
+                        self.restore_status = None;
+                        self.show_restore_backups = true;
+                    }
+                });
             }
             3 => {
                 // ── Editor ────────────────────────────────────────────
@@ -6413,6 +6491,151 @@ impl GrepApp {
         });
     }
 
+    /// Lists past replace sessions (backed by `manifest.json` files under
+    /// `backup_dir`) and lets the user restore some/all of a session's
+    /// files from their pre-replace backup (#22 undo). `self.restore_sessions`
+    /// is populated once when the window is opened (Settings > Replace >
+    /// "Restore…").
+    fn show_restore_backups_window(&mut self, ui: &mut Ui) {
+        let pal = self.pal;
+        if self.restore_sessions.is_empty() {
+            ui.label(
+                RichText::new("No backup sessions found.")
+                    .color(pal.muted)
+                    .size(12.0),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new("Close").color(pal.subtext).size(13.0))
+                    .clicked()
+                {
+                    self.show_restore_backups = false;
+                }
+            });
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            // ── Session list (left) ──────────────────────────────────
+            ScrollArea::vertical()
+                .id_salt("restore_sessions")
+                .max_width(180.0)
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for (i, session) in self.restore_sessions.iter().enumerate() {
+                        let active = self.restore_selected_session == Some(i);
+                        let label = format_session_timestamp(&session.timestamp);
+                        if ui
+                            .add(egui::Button::selectable(
+                                active,
+                                RichText::new(label)
+                                    .color(if active { pal.accent } else { pal.subtext })
+                                    .size(11.5),
+                            ))
+                            .on_hover_text(format!(
+                                "{} → {}  ({} file(s))",
+                                session.pattern,
+                                session.replace_text,
+                                session.files.len()
+                            ))
+                            .clicked()
+                        {
+                            self.restore_selected_session = Some(i);
+                            self.restore_excluded_files.clear();
+                            self.restore_status = None;
+                        }
+                    }
+                });
+
+            ui.separator();
+
+            // ── Selected session's files (right) ─────────────────────
+            ui.vertical(|ui| {
+                let Some(session) = self
+                    .restore_selected_session
+                    .and_then(|i| self.restore_sessions.get(i))
+                    .cloned()
+                else {
+                    ui.label(
+                        RichText::new("Select a session on the left.")
+                            .color(pal.muted)
+                            .size(11.0),
+                    );
+                    return;
+                };
+                ui.label(
+                    RichText::new(format!("{} → {}", session.pattern, session.replace_text))
+                        .color(pal.subtext)
+                        .size(11.0),
+                );
+                ui.add_space(4.0);
+                ScrollArea::vertical()
+                    .id_salt("restore_files")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for file in &session.files {
+                            let mut included = !self.restore_excluded_files.contains(file);
+                            if ui
+                                .checkbox(&mut included, file.to_string_lossy().as_ref())
+                                .changed()
+                            {
+                                if included {
+                                    self.restore_excluded_files.remove(file);
+                                } else {
+                                    self.restore_excluded_files.insert(file.clone());
+                                }
+                            }
+                        }
+                    });
+                ui.add_space(8.0);
+                let selected_files: Vec<PathBuf> = session
+                    .files
+                    .iter()
+                    .filter(|f| !self.restore_excluded_files.contains(*f))
+                    .cloned()
+                    .collect();
+                if let Some(status) = &self.restore_status {
+                    ui.label(RichText::new(status).color(pal.green).size(11.0));
+                }
+                ui.horizontal(|ui| {
+                    let n = selected_files.len();
+                    if ui
+                        .add_enabled(
+                            n > 0,
+                            egui::Button::new(
+                                RichText::new(format!("Restore {n} file(s)"))
+                                    .color(pal.bg_mantle)
+                                    .size(13.0),
+                            )
+                            .fill(pal.red),
+                        )
+                        .on_hover_text("Overwrite current file content with this session's backup")
+                        .clicked()
+                    {
+                        let backup_root = Path::new(&self.config.backup_dir);
+                        let (ok, err) = crate::grep::restore_from_backup(
+                            backup_root,
+                            &session.timestamp,
+                            &selected_files,
+                        );
+                        self.restore_status = Some(if err == 0 {
+                            format!("Restored {ok} file(s).")
+                        } else {
+                            format!("Restored {ok} file(s), {err} error(s).")
+                        });
+                    }
+                    if ui
+                        .button(RichText::new("Close").color(pal.subtext).size(13.0))
+                        .clicked()
+                    {
+                        self.show_restore_backups = false;
+                    }
+                });
+            });
+        });
+    }
+
     fn show_replace_preview_window(&mut self, ui: &mut Ui) {
         let pal = self.pal;
         let Some((params, entries)) = &self.replace_preview else {
@@ -6459,13 +6682,24 @@ impl GrepApp {
                     ui.add_space(8.0);
                 }
 
-                // File header
-                ui.label(
-                    RichText::new(path.to_string_lossy().as_ref())
-                        .monospace()
-                        .color(pal.accent)
-                        .size(11.5),
-                );
+                // File header with a checkbox to include/exclude this file
+                // from "Replace Selected" (#22 selective replace).
+                let mut included = !self.replace_preview_excluded.contains(path);
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut included, "").changed() {
+                        if included {
+                            self.replace_preview_excluded.remove(path);
+                        } else {
+                            self.replace_preview_excluded.insert(path.clone());
+                        }
+                    }
+                    ui.label(
+                        RichText::new(path.to_string_lossy().as_ref())
+                            .monospace()
+                            .color(pal.accent)
+                            .size(11.5),
+                    );
+                });
                 ui.painter().hline(
                     ui.available_rect_before_wrap().x_range(),
                     ui.cursor().top(),
@@ -6643,29 +6877,42 @@ impl GrepApp {
             }
         });
 
+        let selected_files: Vec<FileMatch> = entries
+            .iter()
+            .filter(|(path, _, _)| !self.replace_preview_excluded.contains(path))
+            .map(|(path, _, _)| FileMatch {
+                path: path.clone(),
+                matches: vec![],
+            })
+            .collect();
+
         ui.separator();
         ui.horizontal(|ui| {
+            let n = selected_files.len();
             if ui
-                .add(
-                    egui::Button::new(RichText::new("Apply All").color(pal.bg_mantle))
-                        .fill(pal.accent),
+                .add_enabled(
+                    n > 0,
+                    egui::Button::new(
+                        RichText::new(format!("Replace Selected ({n})")).color(pal.bg_mantle),
+                    )
+                    .fill(pal.accent),
                 )
-                .on_hover_text("Write all previewed replacements to disk")
+                .on_hover_text(
+                    "Write the checked files' replacements to disk (backed up first if enabled)",
+                )
                 .clicked()
             {
-                let mut ok = 0usize;
-                let mut err = 0usize;
-                for (path, _, preview) in &entries {
-                    if std::fs::write(path, preview).is_ok() {
-                        ok += 1;
-                    } else {
-                        err += 1;
-                    }
-                }
-                if err == 0 {
-                    self.status_msg = format!("Replaced {} file(s)", ok);
-                } else {
-                    self.status_msg = format!("Replaced {}, {} write error(s)", ok, err);
+                if let Ok(regex) = build_regex(&params) {
+                    let summary = self.run_and_record_replace(
+                        &selected_files,
+                        &regex,
+                        &params.pattern,
+                        &params.replace_text,
+                    );
+                    self.status_msg = format!(
+                        "Replaced {} instances in {} files ({} errors)",
+                        summary.replaced_instances, summary.ok, summary.err
+                    );
                 }
                 self.replace_preview = None;
             }
@@ -8141,6 +8388,16 @@ fn format_ts(ts: &str) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
+/// Formats a backup session directory name (`%Y%m%d-%H%M%S`, see
+/// `grep::backup_file_to`/`ReplaceSessionManifest`) for display in the
+/// Restore-from-backup window (#22). Falls back to the raw name if it
+/// doesn't parse (defensive — session names are always this format today).
+fn format_session_timestamp(session_dir_name: &str) -> String {
+    chrono::NaiveDateTime::parse_from_str(session_dir_name, "%Y%m%d-%H%M%S")
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|_| session_dir_name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8326,7 +8583,8 @@ mod tests {
             ReplaceSummary {
                 ok: 1,
                 err: 0,
-                replaced_instances: 1
+                replaced_instances: 1,
+                replaced_files: vec![file.clone()],
             }
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "bar123");
@@ -8389,7 +8647,8 @@ mod tests {
             ReplaceSummary {
                 ok: 0,
                 err: 1,
-                replaced_instances: 0
+                replaced_instances: 0,
+                replaced_files: vec![],
             }
         );
     }
@@ -8415,7 +8674,8 @@ mod tests {
             ReplaceSummary {
                 ok: 0,
                 err: 1,
-                replaced_instances: 0
+                replaced_instances: 0,
+                replaced_files: vec![],
             }
         );
     }
@@ -8441,6 +8701,7 @@ mod tests {
         assert_eq!(summary.ok, 2);
         assert_eq!(summary.err, 0);
         assert_eq!(summary.replaced_instances, 3);
+        assert_eq!(summary.replaced_files, vec![file1.clone(), file2.clone()]);
         assert_eq!(std::fs::read_to_string(&file1).unwrap(), "bar bar");
         assert_eq!(std::fs::read_to_string(&file2).unwrap(), "bar");
     }
