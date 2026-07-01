@@ -278,6 +278,12 @@ pub struct GrepApp {
     /// in order to immediately restart it with a newer pattern. Consumed by
     /// `poll_search` to skip its normal "restore the pre-search tab" step.
     incremental_restart_pending: bool,
+    /// #34: whether the currently in-flight (or just-finished) search was
+    /// fired by `poll_incremental_search` rather than an explicit user
+    /// action (Enter/click/etc). Set by `start_search`'s `transient` arg,
+    /// consumed by `finalize_search` to skip auto-recording transient
+    /// mid-typing prefix searches into history.
+    pending_search_transient: bool,
 
     selected_files: BTreeSet<PathBuf>,
     collapsed_files: BTreeSet<PathBuf>,
@@ -401,6 +407,7 @@ impl GrepApp {
             cancel_flag: None,
             incremental_debounce_at: None,
             incremental_restart_pending: false,
+            pending_search_transient: false,
             selected_files: BTreeSet::new(),
             collapsed_files: BTreeSet::new(),
             view_mode: ViewMode::Tree,
@@ -687,7 +694,12 @@ impl GrepApp {
         }
     }
 
-    fn start_search(&mut self) {
+    /// `transient` (#34): true when this is a `poll_incremental_search`
+    /// mid-typing fire rather than an explicit user action (Enter/click/
+    /// history rerun/etc). Stashed into `pending_search_transient` so
+    /// `finalize_search` can skip auto-recording transient prefix searches
+    /// into history — everything else about the search runs identically.
+    fn start_search(&mut self, transient: bool) {
         // Ignore re-entry while a search is already running. Spawning a second
         // worker would have it share `search_state` with the first; whichever
         // finishes last clobbers the other's state, finalizing with the wrong
@@ -711,6 +723,8 @@ impl GrepApp {
             self.status_msg = format!("Invalid pattern: {}", e);
             return;
         }
+
+        self.pending_search_transient = transient;
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.cancel_flag = Some(Arc::clone(&cancel));
@@ -774,6 +788,10 @@ impl GrepApp {
     }
 
     fn finalize_search(&mut self, ms: u64, truncated: bool, cancelled: bool) {
+        // #34: consumed exactly once per finalize, mirroring how
+        // `poll_search` takes `incremental_restart_pending` — set fresh by
+        // `start_search` for the search this finalize corresponds to.
+        let transient = std::mem::take(&mut self.pending_search_transient);
         // Drain any remaining results from the channel
         if let Some(rx) = self.search_result_rx.take() {
             for fm in rx.try_iter() {
@@ -829,7 +847,9 @@ impl GrepApp {
         // Auto records every completed search (#24); Manual/Off don't —
         // Manual instead exposes an explicit "Save to history" action
         // (record_to_history) that the user triggers on the current result.
-        if should_auto_record(self.config.history_mode) {
+        // Transient incremental-search prefix fires are excluded even in
+        // Auto mode (#34) — they're mid-typing noise, not a search intent.
+        if should_record_search(self.config.history_mode, transient) {
             self.record_to_history(&result);
         }
         // `current_match`'s second element is the index among *only* the
@@ -955,7 +975,7 @@ impl GrepApp {
         }
         self.incremental_debounce_at = None;
         if should_fire_incremental_search(&self.params.pattern, &self.params.directory) {
-            self.start_search();
+            self.start_search(true);
         }
     }
 
@@ -1178,7 +1198,7 @@ impl GrepApp {
     fn rerun_history_entry(&mut self, entry: &HistoryEntry) {
         self.ensure_empty_tab();
         self.params = entry.params.clone();
-        self.start_search();
+        self.start_search(false);
     }
 
     fn do_replace_preview(&mut self) {
@@ -2456,7 +2476,7 @@ impl GrepApp {
             }
             PaletteAction::RerunSearch => {
                 if self.current_result.is_some() {
-                    self.start_search();
+                    self.start_search(false);
                 }
             }
             PaletteAction::ClearResults => {
@@ -2814,12 +2834,12 @@ impl GrepApp {
                             picked_dir = Some(dir_filtered[idx].clone());
                         }
                     } else {
-                        self.start_search();
+                        self.start_search(false);
                     }
                     egui::Popup::close_id(ui.ctx(), dir_popup_id);
                     self.dir_suggest_idx = None;
                 } else {
-                    self.start_search();
+                    self.start_search(false);
                 }
             }
 
@@ -3036,7 +3056,7 @@ impl GrepApp {
                 if is_searching {
                     self.cancel_search();
                 } else {
-                    self.start_search();
+                    self.start_search(false);
                 }
             }
 
@@ -3056,12 +3076,12 @@ impl GrepApp {
                             picked_pattern = Some(pat_filtered[idx].clone());
                         }
                     } else {
-                        self.start_search();
+                        self.start_search(false);
                     }
                     egui::Popup::close_id(ui.ctx(), pat_popup_id);
                     self.pat_suggest_idx = None;
                 } else {
-                    self.start_search();
+                    self.start_search(false);
                 }
             }
 
@@ -7889,6 +7909,16 @@ fn should_auto_record(mode: HistoryMode) -> bool {
     mode == HistoryMode::Auto
 }
 
+/// Whether a just-completed search should actually be recorded into
+/// history (#34): `should_auto_record` gates on history_mode alone, but a
+/// `transient` search — a `poll_incremental_search` mid-typing prefix fire,
+/// not an explicit user action — should never be recorded even in Auto
+/// mode, since it's not a real search intent. Pure, mirroring
+/// `should_auto_record`'s existing testable-in-isolation shape.
+fn should_record_search(mode: HistoryMode, transient: bool) -> bool {
+    should_auto_record(mode) && !transient
+}
+
 /// Whether the Manual "Save to history" button should be enabled for
 /// `current_id` (#26). Debounces repeat clicks on the same result: once
 /// `current_id` has been saved, disable Save until a new search produces a
@@ -8909,6 +8939,28 @@ mod tests {
         assert!(should_auto_record(HistoryMode::Auto));
         assert!(!should_auto_record(HistoryMode::Manual));
         assert!(!should_auto_record(HistoryMode::Off));
+    }
+
+    // #34: incremental search shouldn't flood history with transient
+    // mid-typing prefix queries, even in Auto mode.
+    #[test]
+    fn test_should_record_search_skips_transient_in_auto_mode() {
+        assert!(!should_record_search(HistoryMode::Auto, true));
+    }
+
+    #[test]
+    fn test_should_record_search_records_explicit_in_auto_mode() {
+        assert!(should_record_search(HistoryMode::Auto, false));
+    }
+
+    #[test]
+    fn test_should_record_search_manual_and_off_unaffected_by_transient() {
+        // Manual/Off already don't auto-record anything, regardless of
+        // transient — should_record_search must not turn them on.
+        for mode in [HistoryMode::Manual, HistoryMode::Off] {
+            assert!(!should_record_search(mode, false));
+            assert!(!should_record_search(mode, true));
+        }
     }
 
     // #26: debounce Manual "Save to history"
