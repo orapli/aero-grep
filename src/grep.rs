@@ -573,11 +573,35 @@ pub fn backup_file_to(path: &Path, backup_root: &Path, session_dir_name: &str) -
     Ok(())
 }
 
+/// Returns a session directory name unique under `backup_root`, based on
+/// `now` (#33). Two replace runs in the same second would otherwise share
+/// one directory, silently overwriting each other's `manifest.json` and
+/// any backed-up files they have in common — this appends a numeric
+/// `-<n>` suffix on collision, keeping the `%Y%m%d-%H%M%S` prefix intact
+/// (so `cleanup_expired_backups`/`format_session_timestamp`'s "try direct
+/// parse, else strip a trailing `-<digits>`" fallback can still recover
+/// the original timestamp).
+pub fn unique_session_dir_name(backup_root: &Path, now: chrono::DateTime<chrono::Local>) -> String {
+    let base = now.format("%Y%m%d-%H%M%S").to_string();
+    if !backup_root.join(&base).exists() {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !backup_root.join(&candidate).exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Records which files a replace session backed up, so a later restore (#22)
 /// can find and reverse it. Written once per session, alongside the backup
 /// copies under `backup_root/<timestamp>/`. `timestamp` doubles as the
 /// session directory name (it's already the `%Y%m%d-%H%M%S` format
-/// `cleanup_expired_backups` and `backup_file_to` use).
+/// `cleanup_expired_backups` and `backup_file_to` use, possibly with a
+/// `unique_session_dir_name`-added `-<n>` suffix on same-second collision).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplaceSessionManifest {
     pub timestamp: String,
@@ -658,6 +682,26 @@ pub fn restore_from_backup(
     (ok, err)
 }
 
+/// Parses a session directory name into its `NaiveDateTime`, plus the
+/// `unique_session_dir_name`-added collision suffix if present (#33) — e.g.
+/// `"20260101-120000-2"` -> `(2026-01-01 12:00:00, Some("2"))`. Returns
+/// `None` if `name` matches neither the plain nor suffixed form. Shared by
+/// `cleanup_expired_backups` (retention, which only needs the timestamp)
+/// and `format_session_timestamp` (Restore-window display, src/app.rs,
+/// which also surfaces the suffix to disambiguate same-second sessions)
+/// so both agree on how a suffixed name is recovered.
+pub fn parse_session_timestamp(name: &str) -> Option<(chrono::NaiveDateTime, Option<&str>)> {
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(name, "%Y%m%d-%H%M%S") {
+        return Some((dt, None));
+    }
+    let (base, suffix) = name.rsplit_once('-')?;
+    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let dt = chrono::NaiveDateTime::parse_from_str(base, "%Y%m%d-%H%M%S").ok()?;
+    Some((dt, Some(suffix)))
+}
+
 pub fn cleanup_expired_backups(backup_dir: &str, retention_days: usize) -> Result<()> {
     if backup_dir.is_empty() || retention_days == 0 {
         return Ok(());
@@ -677,9 +721,7 @@ pub fn cleanup_expired_backups(backup_dir: &str, retention_days: usize) -> Resul
         };
         if ft.is_dir() {
             if let Some(name_str) = entry.file_name().to_str() {
-                if let Ok(parsed_dt) =
-                    chrono::NaiveDateTime::parse_from_str(name_str, "%Y%m%d-%H%M%S")
-                {
+                if let Some((parsed_dt, _)) = parse_session_timestamp(name_str) {
                     let duration = now.signed_duration_since(parsed_dt);
                     if duration.num_days() >= retention_days as i64 {
                         let _ = std::fs::remove_dir_all(entry.path());
@@ -1466,6 +1508,74 @@ mod tests {
         // Old directory should be deleted, fresh directory should remain
         assert!(!old_dir.exists());
         assert!(fresh_dir.exists());
+    }
+
+    // #33: same-second replace session collisions
+
+    #[test]
+    fn test_unique_session_dir_name_no_collision_returns_base() {
+        let dir = tempdir().unwrap();
+        let backup_root = dir.path().join("backups");
+        let now = chrono::Local::now();
+        let name = unique_session_dir_name(&backup_root, now);
+        assert_eq!(name, now.format("%Y%m%d-%H%M%S").to_string());
+    }
+
+    #[test]
+    fn test_unique_session_dir_name_avoids_collision() {
+        let dir = tempdir().unwrap();
+        let backup_root = dir.path().join("backups");
+        let now = chrono::Local::now();
+
+        let first = unique_session_dir_name(&backup_root, now);
+        std::fs::create_dir_all(backup_root.join(&first)).unwrap();
+
+        // Same `now` simulates a second replace landing in the same second.
+        let second = unique_session_dir_name(&backup_root, now);
+        assert_ne!(first, second);
+        assert_eq!(second, format!("{first}-2"));
+
+        std::fs::create_dir_all(backup_root.join(&second)).unwrap();
+        let third = unique_session_dir_name(&backup_root, now);
+        assert_eq!(third, format!("{first}-3"));
+    }
+
+    #[test]
+    fn test_parse_session_timestamp_plain_and_suffixed() {
+        let plain =
+            chrono::NaiveDateTime::parse_from_str("20260101-120000", "%Y%m%d-%H%M%S").unwrap();
+        assert_eq!(
+            parse_session_timestamp("20260101-120000"),
+            Some((plain, None))
+        );
+        assert_eq!(
+            parse_session_timestamp("20260101-120000-2"),
+            Some((plain, Some("2")))
+        );
+        assert_eq!(
+            parse_session_timestamp("20260101-120000-17"),
+            Some((plain, Some("17")))
+        );
+        assert_eq!(parse_session_timestamp("not-a-timestamp"), None);
+        assert_eq!(parse_session_timestamp("20260101-120000-abc"), None);
+    }
+
+    #[test]
+    fn test_cleanup_expired_backups_expires_suffixed_session() {
+        let dir = tempdir().unwrap();
+        let backup_root = dir.path().join("backups");
+        std::fs::create_dir_all(&backup_root).unwrap();
+
+        // A same-second collision that got a -2 suffix, backdated 10 days.
+        let old_dt = chrono::Local::now().naive_local() - chrono::Duration::days(10);
+        let old_name = format!("{}-2", old_dt.format("%Y%m%d-%H%M%S"));
+        let old_dir = backup_root.join(&old_name);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("old_file.txt"), "old").unwrap();
+
+        cleanup_expired_backups(&backup_root.to_string_lossy(), 7).unwrap();
+
+        assert!(!old_dir.exists());
     }
 
     // #22: replace session manifest + restore (undo)

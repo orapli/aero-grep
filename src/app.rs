@@ -1296,8 +1296,12 @@ impl GrepApp {
         pattern: &str,
         replace_text: &str,
     ) -> ReplaceSummary {
-        let session_dir_name = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
         let backup_root = std::path::Path::new(&self.config.backup_dir).to_path_buf();
+        // #33: uniquify against same-second collisions rather than always
+        // using the bare timestamp, so two rapid replaces don't share a
+        // session dir (which would overwrite each other's manifest/backups).
+        let session_dir_name =
+            crate::grep::unique_session_dir_name(&backup_root, chrono::Local::now());
         let summary = run_replace_all(
             files,
             regex,
@@ -8493,19 +8497,56 @@ fn format_ts(ts: &str) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
-/// Formats a backup session directory name (`%Y%m%d-%H%M%S`, see
-/// `grep::backup_file_to`/`ReplaceSessionManifest`) for display in the
-/// Restore-from-backup window (#22). Falls back to the raw name if it
-/// doesn't parse (defensive — session names are always this format today).
+/// Formats a backup session directory name (`%Y%m%d-%H%M%S`, optionally
+/// `unique_session_dir_name`-suffixed with `-<n>` on a same-second
+/// collision, see `grep::backup_file_to`/`ReplaceSessionManifest`) for
+/// display in the Restore-from-backup window (#22). Falls back to the raw
+/// name if it doesn't parse (defensive — session names are always one of
+/// these two forms today).
 fn format_session_timestamp(session_dir_name: &str) -> String {
-    chrono::NaiveDateTime::parse_from_str(session_dir_name, "%Y%m%d-%H%M%S")
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|_| session_dir_name.to_string())
+    let Some((dt, suffix)) = crate::grep::parse_session_timestamp(session_dir_name) else {
+        return session_dir_name.to_string();
+    };
+    let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    match suffix {
+        // A same-second collision suffix (#33): the sibling session shares
+        // this exact display string otherwise, so surface it to tell them
+        // apart in the Restore window's session list.
+        Some(n) => format!("{base} (#{n})"),
+        None => base,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #33: same-second replace session collisions — format_session_timestamp
+    // disambiguates a unique_session_dir_name-suffixed name in the Restore
+    // window's session list.
+    #[test]
+    fn test_format_session_timestamp_plain() {
+        assert_eq!(
+            format_session_timestamp("20260101-120000"),
+            "2026-01-01 12:00:00"
+        );
+    }
+
+    #[test]
+    fn test_format_session_timestamp_suffixed_shows_disambiguator() {
+        assert_eq!(
+            format_session_timestamp("20260101-120000-2"),
+            "2026-01-01 12:00:00 (#2)"
+        );
+    }
+
+    #[test]
+    fn test_format_session_timestamp_falls_back_on_garbage() {
+        assert_eq!(
+            format_session_timestamp("not-a-timestamp"),
+            "not-a-timestamp"
+        );
+    }
 
     // #23: incremental search — should_fire_incremental_search is pure
     // (no I/O, no timers), so the min-length/directory gating is
