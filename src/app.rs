@@ -155,6 +155,22 @@ impl Tok {
     }
 }
 
+// #23: search-as-you-type. Debounce delay before an edit auto-fires a
+// search, and the minimum (trimmed, char-counted) pattern length required
+// to fire one — short of that, a single keystroke would otherwise trigger
+// a pathological full-tree scan.
+const INCREMENTAL_DEBOUNCE_MS: u64 = 200;
+const INCREMENTAL_MIN_PATTERN_LEN: usize = 2;
+
+/// Pure: whether a debounced incremental search should actually fire, given
+/// the current pattern/directory (#23). Doesn't fire for patterns under
+/// `INCREMENTAL_MIN_PATTERN_LEN` (avoids a single keystroke triggering a
+/// full-tree scan) or an empty directory (mirrors `start_search`'s own
+/// early-return guard).
+fn should_fire_incremental_search(pattern: &str, directory: &str) -> bool {
+    pattern.trim().chars().count() >= INCREMENTAL_MIN_PATTERN_LEN && !directory.is_empty()
+}
+
 // ── Search state ─────────────────────────────────────────────────────────────
 enum SearchState {
     Idle,
@@ -254,6 +270,14 @@ pub struct GrepApp {
     tabs: Vec<ResultTab>,
     active_tab: Option<usize>,
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// #23 incremental search: when set, `poll_incremental_search` fires a
+    /// search once `Instant::now()` reaches this. Re-armed on every pattern
+    /// edit while `config.incremental_search` is on.
+    incremental_debounce_at: Option<Instant>,
+    /// #23: true while a `Running` search has been deliberately cancelled
+    /// in order to immediately restart it with a newer pattern. Consumed by
+    /// `poll_search` to skip its normal "restore the pre-search tab" step.
+    incremental_restart_pending: bool,
 
     selected_files: BTreeSet<PathBuf>,
     collapsed_files: BTreeSet<PathBuf>,
@@ -375,6 +399,8 @@ impl GrepApp {
             tabs: Vec::new(),
             active_tab: None,
             cancel_flag: None,
+            incremental_debounce_at: None,
+            incremental_restart_pending: false,
             selected_files: BTreeSet::new(),
             collapsed_files: BTreeSet::new(),
             view_mode: ViewMode::Tree,
@@ -854,6 +880,15 @@ impl GrepApp {
 
         self.cancel_flag = None;
 
+        // #23 incremental search: consumed exactly once per terminal-state
+        // resolution, regardless of which state it turns out to be — if the
+        // in-flight search happened to finish naturally (Done) in the small
+        // window between `poll_incremental_search` checking `Running` and
+        // calling `cancel_search()`, this still gets cleared so it can't
+        // leak into a later, unrelated cancellation (e.g. the user pressing
+        // Stop) and suppress its normal tab-restore.
+        let incremental_restart = std::mem::take(&mut self.incremental_restart_pending);
+
         match state {
             SearchState::Done(ms, truncated) => {
                 self.finalize_search(ms, truncated, false);
@@ -863,6 +898,15 @@ impl GrepApp {
                 self.search_live_files.clear();
                 self.status_msg = format!("Error: {}", e);
                 self.last_search_error = Some(e);
+            }
+            SearchState::Cancelled if incremental_restart => {
+                // Deliberately cancelled to restart with a newer pattern
+                // (not a user Stop): drop the partial results and skip the
+                // usual tab-restore below — `poll_incremental_search` fires
+                // the next search this same frame, so restoring first would
+                // just flash the older results before they're overwritten.
+                self.search_result_rx = None;
+                self.search_live_files.clear();
             }
             SearchState::Cancelled => {
                 self.finalize_search(0, false, true);
@@ -880,6 +924,38 @@ impl GrepApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Search-as-you-type (#23): debounces edits to the pattern field
+    /// (`incremental_debounce_at`, armed by the pattern `TextEdit`'s
+    /// `changed()` handler in `show_toolbar`) and fires a search once the
+    /// timer elapses. If a previous incremental search is still `Running`,
+    /// cancels it and keeps the timer armed to retry next frame — this is
+    /// the "cancel the in-flight search, then start the next" behavior the
+    /// issue asks for, rather than silently ignoring the keystroke (which
+    /// `start_search`'s normal re-entrancy guard would otherwise do).
+    fn poll_incremental_search(&mut self, ctx: &egui::Context) {
+        if !self.config.incremental_search {
+            self.incremental_debounce_at = None;
+            return;
+        }
+        let Some(at) = self.incremental_debounce_at else {
+            return;
+        };
+        if Instant::now() < at {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            return;
+        }
+        if matches!(*self.search_state.lock().unwrap(), SearchState::Running) {
+            self.incremental_restart_pending = true;
+            self.cancel_search();
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            return;
+        }
+        self.incremental_debounce_at = None;
+        if should_fire_incremental_search(&self.params.pattern, &self.params.directory) {
+            self.start_search();
         }
     }
 
@@ -1610,6 +1686,7 @@ impl eframe::App for GrepApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_search();
+        self.poll_incremental_search(&ctx);
         self.ensure_theme_applied(&ctx);
 
         // Disable global shortcuts when any modal/subwindow is open
@@ -2878,6 +2955,12 @@ impl GrepApp {
                     egui::Popup::close_id(ui.ctx(), pat_popup_id);
                 }
                 self.pat_suggest_idx = None;
+                // #23: (re-)arm the incremental-search debounce on every edit.
+                if self.config.incremental_search {
+                    self.incremental_debounce_at = Some(
+                        Instant::now() + std::time::Duration::from_millis(INCREMENTAL_DEBOUNCE_MS),
+                    );
+                }
             }
             // Auto-open on focus gain or re-click while already focused
             // (suppressed when focus was restored after suggestion selection)
@@ -5423,6 +5506,14 @@ impl GrepApp {
                     } else {
                         ui.label(RichText::new("Unlimited").color(pal.muted));
                     }
+                });
+                settings_row(ui, pal, "Incremental search", |ui| {
+                    ui.checkbox(
+                        &mut self.config.incremental_search,
+                        format!(
+                            "Search as you type ({INCREMENTAL_DEBOUNCE_MS} ms debounce, {INCREMENTAL_MIN_PATTERN_LEN}+ char minimum)"
+                        ),
+                    );
                 });
 
                 settings_group_header(ui, pal, "History");
@@ -8401,6 +8492,27 @@ fn format_session_timestamp(session_dir_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #23: incremental search — should_fire_incremental_search is pure
+    // (no I/O, no timers), so the min-length/directory gating is
+    // unit-testable without a GrepApp/eframe context.
+    #[test]
+    fn test_should_fire_incremental_search_respects_min_length() {
+        assert!(!should_fire_incremental_search("f", "/tmp"));
+        assert!(should_fire_incremental_search("fo", "/tmp"));
+    }
+
+    #[test]
+    fn test_should_fire_incremental_search_requires_directory() {
+        assert!(!should_fire_incremental_search("foo", ""));
+    }
+
+    #[test]
+    fn test_should_fire_incremental_search_trims_whitespace() {
+        // Trimmed length 1 < INCREMENTAL_MIN_PATTERN_LEN, so this must not fire.
+        assert!(!should_fire_incremental_search("  f  ", "/tmp"));
+        assert!(should_fire_incremental_search("  fo  ", "/tmp"));
+    }
 
     // #20: editor integration presets — build_editor_invocation is pure
     // (no I/O), so the argv construction is fully unit-testable without

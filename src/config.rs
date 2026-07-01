@@ -363,6 +363,11 @@ pub struct Config {
     pub default_is_regex: bool,
     #[serde(default)]
     pub default_word_boundary: bool,
+    /// Search-as-you-type (#23): debounced auto-search while editing the
+    /// pattern field. Default off — it's an opt-in showcase feature, not
+    /// the default (avoids surprising users who expect Enter/click-to-run).
+    #[serde(default)]
+    pub incremental_search: bool,
 }
 
 impl Default for Config {
@@ -403,6 +408,7 @@ impl Default for Config {
             default_case_sensitive: false,
             default_is_regex: false,
             default_word_boundary: false,
+            incremental_search: false,
         }
     }
 }
@@ -505,6 +511,7 @@ mod tests {
             restored.default_word_boundary
         );
         assert_eq!(original.editor_preset, restored.editor_preset);
+        assert_eq!(original.incremental_search, restored.incremental_search);
     }
 
     #[test]
@@ -533,6 +540,13 @@ mod tests {
         assert!(!cfg.default_is_regex);
         assert!(!cfg.default_word_boundary);
         assert_eq!(cfg.editor_preset, EditorPreset::Custom);
+        assert!(!cfg.incremental_search);
+    }
+
+    // #23: incremental search opt-in default
+    #[test]
+    fn test_incremental_search_defaults_to_off() {
+        assert!(!Config::default().incremental_search);
     }
 
     // #20: editor integration presets
