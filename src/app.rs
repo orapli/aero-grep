@@ -1155,7 +1155,11 @@ impl GrepApp {
         self.replace_confirm_files = files.len();
         self.replace_confirm_matches = crate::grep::count_match_instances(&files);
         self.replace_confirm_snapshot = Some(files);
-        self.show_replace_confirm = true;
+        if self.config.confirm_before_replace {
+            self.show_replace_confirm = true;
+        } else {
+            self.execute_replace();
+        }
     }
 
     fn execute_replace(&mut self) {
@@ -5285,6 +5289,12 @@ impl GrepApp {
             }
             2 => {
                 // ── Replace ───────────────────────────────────────────
+                settings_row(ui, pal, "Confirm before replace", |ui| {
+                    ui.checkbox(
+                        &mut self.config.confirm_before_replace,
+                        "Show a confirmation dialog before replacing",
+                    );
+                });
                 settings_row(ui, pal, "Backup on replace", |ui| {
                     ui.checkbox(&mut self.config.backup_before_replace, "Enable backups");
                 });
@@ -5321,6 +5331,24 @@ impl GrepApp {
                         );
                     });
                 }
+                settings_row(ui, pal, "Open backup folder", |ui| {
+                    let dir_exists = Path::new(&self.config.backup_dir).is_dir();
+                    let resp = ui.add_enabled_ui(dir_exists, |ui| {
+                        if ui
+                            .button(RichText::new("Open").size(12.0))
+                            .on_hover_text("Reveal the backup folder in your file manager")
+                            .clicked()
+                        {
+                            open_in_file_manager(Path::new(&self.config.backup_dir));
+                        }
+                    });
+                    if !dir_exists {
+                        resp.response.on_hover_text(
+                            "Backup folder doesn't exist yet — it's created on the first \
+                             replace with backups enabled",
+                        );
+                    }
+                });
             }
             3 => {
                 // ── Editor ────────────────────────────────────────────
@@ -7750,6 +7778,37 @@ fn open_in_editor(path: &Path, line: Option<usize>, editor_cmd: &str) {
     } else {
         cmd.arg(path);
     }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd.spawn();
+}
+
+/// Reveals `path` in the OS file manager (Finder / Explorer / whatever
+/// handles `xdg-open` on Linux). Best-effort: errors are swallowed, same as
+/// `open_in_editor` (#31).
+fn open_in_file_manager(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(path);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

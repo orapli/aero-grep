@@ -53,6 +53,10 @@ fn default_backup() -> bool {
     true
 }
 
+fn default_confirm_before_replace() -> bool {
+    true
+}
+
 fn default_exclude_dirs() -> String {
     ".git,target,node_modules,.svn,.hg,.idea,.vscode,build,dist".to_string()
 }
@@ -230,6 +234,8 @@ pub struct Config {
     pub font_size: f32,
     #[serde(default = "default_backup")]
     pub backup_before_replace: bool,
+    #[serde(default = "default_confirm_before_replace")]
+    pub confirm_before_replace: bool,
     #[serde(default = "default_exclude_dirs")]
     pub default_exclude_dirs: String,
     #[serde(default = "default_wrap_lines")]
@@ -285,6 +291,7 @@ impl Default for Config {
             theme: Theme::default(),
             font_size: 13.0,
             backup_before_replace: true,
+            confirm_before_replace: true,
             default_exclude_dirs: default_exclude_dirs(),
             wrap_lines: false,
             reduce_motion: false,
@@ -397,6 +404,7 @@ mod tests {
         assert!(cfg.respect_gitignore);
         assert_eq!(cfg.max_result_files, 2000);
         assert!(cfg.backup_before_replace);
+        assert!(cfg.confirm_before_replace);
         assert_eq!(cfg.backup_dir, default_backup_dir());
         assert_eq!(cfg.backup_retention_days, 7);
         assert_eq!(cfg.presets, default_presets());
