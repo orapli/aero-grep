@@ -22,6 +22,29 @@ impl Theme {
     }
 }
 
+/// Controls whether/how completed searches are recorded into History (#24).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Copy, Default)]
+pub enum HistoryMode {
+    /// Record every completed search automatically (current/legacy behavior).
+    #[default]
+    Auto,
+    /// Record nothing automatically; an explicit "Save to history" action
+    /// records the current search on demand.
+    Manual,
+    /// Never record; the History panel/toggle is hidden.
+    Off,
+}
+
+impl HistoryMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Manual => "Manual",
+            Self::Off => "Off",
+        }
+    }
+}
+
 fn default_font_size() -> f32 {
     13.0
 }
@@ -256,6 +279,8 @@ pub struct Config {
     pub follow_symlinks: bool,
     #[serde(default = "default_search_hidden")]
     pub search_hidden: bool,
+    #[serde(default)]
+    pub history_mode: HistoryMode,
 }
 
 impl Default for Config {
@@ -289,6 +314,7 @@ impl Default for Config {
             search_encoding: default_search_encoding(),
             follow_symlinks: false,
             search_hidden: true,
+            history_mode: HistoryMode::default(),
         }
     }
 }
@@ -374,6 +400,7 @@ mod tests {
             original.export_omit_single_file_name,
             restored.export_omit_single_file_name
         );
+        assert_eq!(original.history_mode, restored.history_mode);
     }
 
     #[test]
@@ -394,6 +421,23 @@ mod tests {
         assert_eq!(cfg.export_header_format, default_export_header_format());
         assert!(!cfg.export_header_enabled);
         assert!(!cfg.export_omit_single_file_name);
+        assert_eq!(cfg.history_mode, HistoryMode::Auto);
+    }
+
+    // #24: history recording mode
+    #[test]
+    fn test_history_mode_default_is_auto() {
+        assert_eq!(HistoryMode::default(), HistoryMode::Auto);
+        assert_eq!(Config::default().history_mode, HistoryMode::Auto);
+    }
+
+    #[test]
+    fn test_history_mode_serde_roundtrip() {
+        for mode in [HistoryMode::Auto, HistoryMode::Manual, HistoryMode::Off] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let restored: HistoryMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, mode);
+        }
     }
 
     #[test]

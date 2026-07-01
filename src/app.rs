@@ -1,4 +1,4 @@
-use crate::config::{Config, Theme};
+use crate::config::{Config, HistoryMode, Theme};
 use crate::grep::{apply_replace, build_regex, count_total_matches, search};
 use crate::history::History;
 use crate::models::{
@@ -213,6 +213,12 @@ pub struct GrepApp {
     params: SearchParams,
     config: Config,
     history: History,
+    /// Monotonic id source for `SearchResult`/history, independent of how
+    /// many searches actually get recorded (#24: in Manual/Off mode, most
+    /// searches are never pushed to `history`, so `History::next_id()` —
+    /// derived from `history.entries`' max id — would keep handing out the
+    /// same id to every search until one finally gets recorded).
+    next_history_id: u64,
 
     search_state: Arc<Mutex<SearchState>>,
     current_result: Option<SearchResult>,
@@ -260,6 +266,9 @@ pub struct GrepApp {
     status_msg: String,
     copied_flash: Option<std::time::Instant>,
     copied_file_flash: Option<(PathBuf, std::time::Instant)>,
+    /// Brief highlight on the "Save to history" button (#24, Manual mode)
+    /// after a successful manual save, mirroring `copied_flash`'s pattern.
+    history_saved_flash: Option<std::time::Instant>,
     focus_pattern: bool,
     focus_dir: bool,
     pat_suppress_popup_open: bool,
@@ -301,11 +310,13 @@ impl GrepApp {
         let applied_theme = config.theme.clone();
         let applied_font_size = config.font_size;
         let history = History::load(config.history_limit);
+        let next_history_id = history.next_id();
 
         Self {
             params: SearchParams::default(),
             config,
             history,
+            next_history_id,
             search_state: Arc::new(Mutex::new(SearchState::Idle)),
             current_result: None,
             tabs: Vec::new(),
@@ -341,6 +352,7 @@ impl GrepApp {
             status_msg: "Ready".to_string(),
             copied_flash: None,
             copied_file_flash: None,
+            history_saved_flash: None,
             focus_pattern: false,
             focus_dir: false,
             pat_suppress_popup_open: false,
@@ -750,8 +762,10 @@ impl GrepApp {
         for f in &files {
             self.selected_files.insert(f.path.clone());
         }
+        let id = self.next_history_id;
+        self.next_history_id += 1;
         let result = SearchResult {
-            id: self.history.next_id(),
+            id,
             params: self.params.clone(),
             timestamp: Local::now().to_rfc3339(),
             duration_ms: ms,
@@ -759,13 +773,12 @@ impl GrepApp {
             truncated,
             files,
         };
-        self.history.push(HistoryEntry::from(&result));
-        // Snapshot the full result to disk so "Load result" can reopen the
-        // exact original results later, even after a restart (#25). The
-        // summary entry above is unaffected if this is skipped (oversized
-        // result, no config dir, etc.) — only "Load result" stays
-        // unavailable for that entry.
-        self.history.save_result(&result);
+        // Auto records every completed search (#24); Manual/Off don't —
+        // Manual instead exposes an explicit "Save to history" action
+        // (record_to_history) that the user triggers on the current result.
+        if should_auto_record(self.config.history_mode) {
+            self.record_to_history(&result);
+        }
         self.current_match = if !result.files.is_empty() && !result.files[0].matches.is_empty() {
             let idx = result.files[0]
                 .matches
@@ -782,6 +795,16 @@ impl GrepApp {
         } else {
             self.current_result = Some(result);
         }
+    }
+
+    /// Records `result` into history: the lightweight summary (#15) and the
+    /// full-result disk snapshot (#25), together. Used by the Auto
+    /// recording path (`finalize_search`) and by the Manual "Save to
+    /// history" action (#24) — saving a summary you could never reopen
+    /// would be pointless, so both modes always do both halves together.
+    fn record_to_history(&mut self, result: &SearchResult) {
+        self.history.push(HistoryEntry::from(result));
+        self.history.save_result(result);
     }
 
     fn poll_search(&mut self) {
@@ -1706,8 +1729,11 @@ impl eframe::App for GrepApp {
         let mut add_new_tab = false;
         let tab_count = tabs_info.len();
 
-        // History panel at global level so it spans full window height (outside tabs)
-        if self.show_history {
+        // History panel at global level so it spans full window height
+        // (outside tabs). Off mode (#24) records nothing, so there is
+        // nothing to show even if `show_history` was left on from a
+        // previous mode.
+        if self.show_history && self.config.history_mode != HistoryMode::Off {
             egui::Panel::right("history_panel")
                 .default_size(300.0)
                 .min_size(220.0)
@@ -1889,7 +1915,11 @@ impl eframe::App for GrepApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
                         self.icon_toggle(ui, "show_settings", icons::SETTINGS, "Settings");
-                        self.icon_toggle(ui, "show_history", icons::HISTORY, "History");
+                        // Off mode (#24) records nothing, so hide the toggle
+                        // entirely rather than show an always-empty panel.
+                        if self.config.history_mode != HistoryMode::Off {
+                            self.icon_toggle(ui, "show_history", icons::HISTORY, "History");
+                        }
                     });
                 });
             });
@@ -2188,6 +2218,11 @@ impl GrepApp {
                     PaletteAction::SetPattern(p.clone()),
                 ));
             }
+        }
+        // Off mode (#24) hides the History UI entirely; don't offer to
+        // toggle a panel that won't show anything.
+        if self.config.history_mode == HistoryMode::Off {
+            items.retain(|(_, _, action)| !matches!(action, PaletteAction::ToggleHistory));
         }
         items
     }
@@ -3988,6 +4023,7 @@ impl GrepApp {
         };
 
         let mut copy_all_req = false;
+        let mut save_to_history_req = false;
 
         // ── Search params header ──────────────────────────────────────────────
         egui::Frame::NONE
@@ -4163,20 +4199,58 @@ impl GrepApp {
                         {
                             copy_all_req = true;
                         }
+
+                        // Manual recording mode (#24): auto-recording is off,
+                        // so offer an explicit action to save the current
+                        // search into history (summary + #25 snapshot).
+                        if self.config.history_mode == HistoryMode::Manual {
+                            let just_saved = self
+                                .history_saved_flash
+                                .is_some_and(|t| t.elapsed().as_millis() < 1500);
+                            if ghost_icon_button(ui, pal, icons::STAR_FULL, just_saved)
+                                .on_hover_text("Save this search to history")
+                                .clicked()
+                            {
+                                save_to_history_req = true;
+                            }
+                        }
                     });
                 });
             });
 
-        if copy_all_req {
+        // Snapshot whatever each pending action needs from `result` — which
+        // borrows `self.current_result` — before doing anything that needs
+        // `&mut self`. Interleaving a `&mut self` call with a later read of
+        // `result` doesn't satisfy the borrow checker regardless of
+        // ordering, since both actions live in the same scope as `result`.
+        let copy_text_payload = if copy_all_req {
             let selected_fm: Vec<&FileMatch> = self
                 .selected_files
                 .iter()
                 .filter_map(|p| result.files.iter().find(|f| &f.path == p))
                 .collect();
-            let text = self.format_matches_to_string(&selected_fm, &result.params);
+            Some(self.format_matches_to_string(&selected_fm, &result.params))
+        } else {
+            None
+        };
+        // Cloning the full result is a deliberate, infrequent user action
+        // (button click), not a hot path, so this one-time clone is a
+        // non-issue.
+        let history_snapshot = if save_to_history_req {
+            Some(result.clone())
+        } else {
+            None
+        };
+
+        if let Some(text) = copy_text_payload {
             if !text.is_empty() {
                 self.copy_text(ui.ctx(), text);
             }
+        }
+        if let Some(result) = history_snapshot {
+            self.record_to_history(&result);
+            self.history_saved_flash = Some(std::time::Instant::now());
+            self.status_msg = "Saved to history".to_string();
         }
 
         let Some(result) = &self.current_result else {
@@ -5032,6 +5106,31 @@ impl GrepApp {
             }
             1 => {
                 // ── Search ────────────────────────────────────────────
+                settings_row(ui, pal, "Search history", |ui| {
+                    for mode in [HistoryMode::Auto, HistoryMode::Manual, HistoryMode::Off] {
+                        let active = self.config.history_mode == mode;
+                        let hover = match mode {
+                            HistoryMode::Auto => "Record every completed search automatically",
+                            HistoryMode::Manual => {
+                                "Don't auto-record; use \"Save to history\" to record on demand"
+                            }
+                            HistoryMode::Off => "Don't record anything; hides the History panel",
+                        };
+                        if ui
+                            .add(egui::Button::selectable(
+                                active,
+                                RichText::new(mode.label())
+                                    .color(if active { pal.accent } else { pal.subtext })
+                                    .size(12.0),
+                            ))
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            self.config.history_mode = mode;
+                            let _ = self.config.save();
+                        }
+                    }
+                });
                 settings_row(ui, pal, "History limit", |ui| {
                     ui.add(egui::Slider::new(&mut self.config.history_limit, 1..=1000));
                 });
@@ -6913,6 +7012,7 @@ mod icons {
     pub const CHECK: &str = "\u{EAB2}"; // checkmark
     pub const GRABBER: &str = "\u{EB02}"; // grabber / drag handle
     pub const WARNING: &str = "\u{EA6C}"; // warning / alert triangle
+    pub const STAR_FULL: &str = "\u{EB59}"; // save to history (manual recording mode)
 }
 
 fn icon_rt(glyph: &str, size: f32, color: Color32) -> RichText {
@@ -7030,6 +7130,14 @@ fn setup_fonts(ctx: &egui::Context, custom_font_path: &str) {
     }
 
     ctx.set_fonts(fonts);
+}
+
+// ── History recording mode (#24) ────────────────────────────────────────────
+/// Whether a just-completed search should be auto-recorded into history.
+/// Pulled out as a pure, mode-only decision so it's directly testable
+/// without needing to drive a full search through `GrepApp`.
+fn should_auto_record(mode: HistoryMode) -> bool {
+    mode == HistoryMode::Auto
 }
 
 // ── Content panel virtualization ────────────────────────────────────────────
@@ -7490,6 +7598,14 @@ fn format_ts(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #24: history recording mode
+    #[test]
+    fn test_should_auto_record_only_in_auto_mode() {
+        assert!(should_auto_record(HistoryMode::Auto));
+        assert!(!should_auto_record(HistoryMode::Manual));
+        assert!(!should_auto_record(HistoryMode::Off));
+    }
 
     // #16: content panel virtualization windowing
     fn uniform_prefix(item_count: usize, row_h: f32) -> Vec<f32> {
