@@ -883,14 +883,7 @@ impl GrepApp {
             return;
         }
 
-        let mut all_matches = Vec::new();
-        for (f_idx, fm) in result.files.iter().enumerate() {
-            for (m_idx, lm) in fm.matches.iter().enumerate() {
-                if lm.is_match {
-                    all_matches.push((f_idx, m_idx));
-                }
-            }
-        }
+        let all_matches = match_navigation_candidates(result, &self.content_filter);
         if all_matches.is_empty() {
             return;
         }
@@ -921,14 +914,7 @@ impl GrepApp {
             return;
         }
 
-        let mut all_matches = Vec::new();
-        for (f_idx, fm) in result.files.iter().enumerate() {
-            for (m_idx, lm) in fm.matches.iter().enumerate() {
-                if lm.is_match {
-                    all_matches.push((f_idx, m_idx));
-                }
-            }
-        }
+        let all_matches = match_navigation_candidates(result, &self.content_filter);
         if all_matches.is_empty() {
             return;
         }
@@ -4343,8 +4329,7 @@ impl GrepApp {
             Some((fm.path.clone(), lm.line_number))
         });
 
-        let content_filter_lower = self.content_filter.to_lowercase();
-        let has_content_filter = !content_filter_lower.is_empty();
+        let has_content_filter = !self.content_filter.is_empty();
 
         let mut items = Vec::new();
         for fm in &files {
@@ -4361,7 +4346,7 @@ impl GrepApp {
                 fm.matches
                     .iter()
                     .filter(|lm| {
-                        lm.is_match && lm.content.to_lowercase().contains(&content_filter_lower)
+                        lm.is_match && contains_ignore_ascii_case(&lm.content, &self.content_filter)
                     })
                     .collect()
             } else {
@@ -7132,6 +7117,48 @@ fn setup_fonts(ctx: &egui::Context, custom_font_path: &str) {
     ctx.set_fonts(fonts);
 }
 
+// ── Content filter (#12, #17) ───────────────────────────────────────────────
+/// ASCII-case-insensitive substring search with no allocation. Used for the
+/// content filter instead of `haystack.to_lowercase().contains(&needle_lower)`,
+/// which allocates a new `String` for every visible line on every frame the
+/// filter is active (#17). Unlike `to_lowercase()`, this only folds ASCII
+/// letters — a deliberate, disclosed narrowing: full Unicode case folding
+/// (e.g. Turkish İ/ı, German ß↔ss) won't match here, but content filtering is
+/// applied to source/text lines where ASCII-insensitive matching covers the
+/// overwhelming majority of real use, and the tradeoff buys allocation-free
+/// filtering on the hot per-frame path.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// Candidate (file_idx, match_idx) pairs for F3/Shift+F3 navigation
+/// (`move_match_next`/`move_match_prev`). When `content_filter` is
+/// non-empty, only match lines that pass it are candidates (#17) —
+/// otherwise F3 could land `current_match` on a line hidden by the filter,
+/// where nothing visibly happens. An empty filter matches everything, same
+/// as before the filter existed.
+fn match_navigation_candidates(result: &SearchResult, content_filter: &str) -> Vec<(usize, usize)> {
+    let mut candidates = Vec::new();
+    for (f_idx, fm) in result.files.iter().enumerate() {
+        for (m_idx, lm) in fm.matches.iter().enumerate() {
+            if lm.is_match && contains_ignore_ascii_case(&lm.content, content_filter) {
+                candidates.push((f_idx, m_idx));
+            }
+        }
+    }
+    candidates
+}
+
 // ── History recording mode (#24) ────────────────────────────────────────────
 /// Whether a just-completed search should be auto-recorded into history.
 /// Pulled out as a pure, mode-only decision so it's directly testable
@@ -7605,6 +7632,86 @@ mod tests {
         assert!(should_auto_record(HistoryMode::Auto));
         assert!(!should_auto_record(HistoryMode::Manual));
         assert!(!should_auto_record(HistoryMode::Off));
+    }
+
+    // #17: content filter polish
+    #[test]
+    fn test_contains_ignore_ascii_case_basic() {
+        assert!(contains_ignore_ascii_case("Hello World", "world"));
+        assert!(contains_ignore_ascii_case("Hello World", "WORLD"));
+        assert!(!contains_ignore_ascii_case("Hello World", "xyz"));
+    }
+
+    #[test]
+    fn test_contains_ignore_ascii_case_empty_needle_matches_all() {
+        assert!(contains_ignore_ascii_case("anything", ""));
+        assert!(contains_ignore_ascii_case("", ""));
+    }
+
+    #[test]
+    fn test_contains_ignore_ascii_case_needle_longer_than_haystack() {
+        assert!(!contains_ignore_ascii_case("hi", "hello"));
+    }
+
+    #[test]
+    fn test_contains_ignore_ascii_case_non_ascii_bytes_no_panic() {
+        // Non-ASCII content must not panic (byte-level comparison), even
+        // though this helper only folds ASCII case (disclosed limitation).
+        assert!(contains_ignore_ascii_case("こんにちは world", "world"));
+        assert!(!contains_ignore_ascii_case("こんにちは", "world"));
+    }
+
+    fn make_line(line_number: usize, content: &str, is_match: bool) -> LineMatch {
+        LineMatch {
+            line_number,
+            content: content.to_string(),
+            ranges: vec![],
+            is_match,
+        }
+    }
+
+    fn sample_result() -> SearchResult {
+        SearchResult {
+            id: 1,
+            params: SearchParams::default(),
+            files: vec![
+                FileMatch {
+                    path: PathBuf::from("a.rs"),
+                    matches: vec![make_line(1, "foo bar", true), make_line(2, "baz qux", true)],
+                },
+                FileMatch {
+                    path: PathBuf::from("b.rs"),
+                    matches: vec![make_line(10, "FOO again", true)],
+                },
+            ],
+            timestamp: "2026-01-01T00:00:00".to_string(),
+            duration_ms: 0,
+            total_matches: 3,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn test_match_navigation_candidates_no_filter_includes_all_matches() {
+        let result = sample_result();
+        let candidates = match_navigation_candidates(&result, "");
+        assert_eq!(candidates, vec![(0, 0), (0, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn test_match_navigation_candidates_filter_excludes_non_matching_lines() {
+        let result = sample_result();
+        // "foo" (case-insensitive) matches file 0 line 0 ("foo bar") and
+        // file 1 line 0 ("FOO again"), but not file 0 line 1 ("baz qux").
+        let candidates = match_navigation_candidates(&result, "foo");
+        assert_eq!(candidates, vec![(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn test_match_navigation_candidates_filter_matching_nothing_is_empty() {
+        let result = sample_result();
+        let candidates = match_navigation_candidates(&result, "nope");
+        assert!(candidates.is_empty());
     }
 
     // #16: content panel virtualization windowing
