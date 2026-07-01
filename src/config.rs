@@ -165,6 +165,26 @@ pub struct Preset {
     pub enabled: bool,
 }
 
+/// A named, reusable search scope (#21): roots + include/exclude filters.
+/// Orthogonal to tabs/history — this is saved *scope*, not a result
+/// snapshot, so it deliberately excludes the pattern/replace text and
+/// per-search flags (case/regex/word/context/depth already have their own
+/// persisted defaults, see #30).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Project {
+    pub name: String,
+    #[serde(default)]
+    pub directory: String,
+    /// Additional search roots beyond `directory`, mirroring
+    /// `SearchParams::roots`.
+    #[serde(default)]
+    pub roots: Vec<String>,
+    #[serde(default)]
+    pub file_glob: String,
+    #[serde(default)]
+    pub exclude_glob: String,
+}
+
 pub fn default_presets() -> Vec<Preset> {
     vec![
         Preset {
@@ -305,6 +325,8 @@ pub struct Config {
     #[serde(default = "default_presets")]
     pub presets: Vec<Preset>,
     #[serde(default)]
+    pub projects: Vec<Project>,
+    #[serde(default)]
     pub export_preset: ExportPreset,
     #[serde(default)]
     pub export_output_mode: ExportOutputMode,
@@ -364,6 +386,7 @@ impl Default for Config {
             backup_retention_days: default_backup_retention_days(),
             custom_font_path: String::new(),
             presets: default_presets(),
+            projects: Vec::new(),
             export_preset: ExportPreset::default(),
             export_output_mode: ExportOutputMode::default(),
             export_line_format: default_export_line_format(),
@@ -397,11 +420,14 @@ impl Config {
         self.default_max_depth = self.default_max_depth.clamp(0, 100);
     }
 
-    /// Resets to defaults while keeping user-created presets (#29).
+    /// Resets to defaults while keeping user-created presets (#29) and
+    /// saved projects (#21) — both are user data, not settings.
     pub fn reset_preserving_presets(&mut self) {
         let presets = std::mem::take(&mut self.presets);
+        let projects = std::mem::take(&mut self.projects);
         *self = Self::default();
         self.presets = presets;
+        self.projects = projects;
     }
 
     pub fn load() -> Self {
@@ -603,6 +629,13 @@ mod tests {
                 glob: "*.custom".to_string(),
                 enabled: true,
             }],
+            projects: vec![Project {
+                name: "My Project".to_string(),
+                directory: "/tmp/proj".to_string(),
+                roots: vec![],
+                file_glob: "*.rs".to_string(),
+                exclude_glob: String::new(),
+            }],
             ..Config::default()
         };
 
@@ -614,5 +647,34 @@ mod tests {
         assert_eq!(cfg.respect_gitignore, defaults.respect_gitignore);
         assert_eq!(cfg.presets.len(), 1);
         assert_eq!(cfg.presets[0].name, "Custom");
+        assert_eq!(cfg.projects.len(), 1);
+        assert_eq!(cfg.projects[0].name, "My Project");
+    }
+
+    // #21: saved projects (roots + filters)
+    #[test]
+    fn test_projects_default_to_empty() {
+        assert!(Config::default().projects.is_empty());
+    }
+
+    #[test]
+    fn test_project_serde_roundtrip() {
+        let original = Project {
+            name: "Frontend".to_string(),
+            directory: "/repo/web".to_string(),
+            roots: vec!["/repo/shared".to_string()],
+            file_glob: "*.ts,*.tsx".to_string(),
+            exclude_glob: "*.test.ts".to_string(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn test_config_missing_projects_field_defaults_to_empty() {
+        let old_json = r#"{"history_limit":100,"max_file_size_mb":50}"#;
+        let cfg: Config = serde_json::from_str(old_json).unwrap();
+        assert!(cfg.projects.is_empty());
     }
 }

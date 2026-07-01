@@ -1,4 +1,4 @@
-use crate::config::{Config, EditorPreset, HistoryMode, Theme};
+use crate::config::{Config, EditorPreset, HistoryMode, Project, Theme};
 use crate::grep::{apply_replace, build_regex, count_total_matches, search};
 use crate::history::History;
 use crate::models::{
@@ -326,6 +326,9 @@ pub struct GrepApp {
     editing_preset_idx: Option<usize>,
     dnd_hovered_preset_idx: Option<usize>,
     last_search_error: Option<String>,
+    show_save_project_popup: bool,
+    project_new_name: String,
+    focus_project_name: bool,
 }
 
 impl GrepApp {
@@ -413,6 +416,9 @@ impl GrepApp {
             editing_preset_idx: None,
             dnd_hovered_preset_idx: None,
             last_search_error: None,
+            show_save_project_popup: false,
+            project_new_name: String::new(),
+            focus_project_name: false,
         }
     }
 
@@ -1563,8 +1569,11 @@ impl eframe::App for GrepApp {
         let modal_open = self.show_replace_confirm
             || self.show_shortcuts
             || self.replace_preview.is_some()
-            || self.show_reset_settings_confirm;
-        let enabled = !self.show_replace_confirm && !self.show_reset_settings_confirm;
+            || self.show_reset_settings_confirm
+            || self.show_save_project_popup;
+        let enabled = !self.show_replace_confirm
+            && !self.show_reset_settings_confirm
+            && !self.show_save_project_popup;
 
         // ── Global keyboard shortcuts ──────────────────────────────────────────
         let mut next_match_req = false;
@@ -1607,6 +1616,7 @@ impl eframe::App for GrepApp {
                     self.show_replace_confirm = false;
                     self.replace_confirm_snapshot = None;
                     self.show_reset_settings_confirm = false;
+                    self.show_save_project_popup = false;
                     if self.replace_preview.is_some() {
                         self.replace_preview = None;
                     } else if self.is_settings_active() {
@@ -2142,6 +2152,18 @@ impl eframe::App for GrepApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(&ctx, |ui| {
                     self.show_reset_settings_confirm_window(ui);
+                });
+        }
+
+        if self.show_save_project_popup {
+            egui::Window::new("Save Project")
+                .collapsible(false)
+                .resizable(false)
+                .max_width(max_w)
+                .max_height(max_h)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    self.show_save_project_window(ui);
                 });
         }
 
@@ -3053,6 +3075,49 @@ impl GrepApp {
                 }
             });
 
+            // Saved projects (#21): reusable roots + filters
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                ui.add_space(label_w + ui.spacing().item_spacing.x);
+                ui.label(RichText::new("Projects:").color(pal.subtext).size(11.0));
+
+                let mut load_idx: Option<usize> = None;
+                let mut delete_idx: Option<usize> = None;
+                for (i, project) in self.config.projects.iter().enumerate() {
+                    let active = self.matches_project(project);
+                    let resp = chip_response(ui, pal, &project.name, active)
+                        .on_hover_text(format!("{}\nRight-click to delete", project.directory));
+                    if resp.clicked() {
+                        load_idx = Some(i);
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("Delete").clicked() {
+                            delete_idx = Some(i);
+                            ui.close();
+                        }
+                    });
+                }
+                if ui
+                    .add(egui::Button::new(icon_rt(icons::ADD, 11.0, pal.accent)).frame(false))
+                    .on_hover_text("Save current directory/roots/filters as a project")
+                    .clicked()
+                {
+                    self.project_new_name.clear();
+                    self.show_save_project_popup = true;
+                    self.focus_project_name = true;
+                }
+
+                if let Some(i) = load_idx {
+                    if let Some(project) = self.config.projects.get(i).cloned() {
+                        self.load_project(&project);
+                    }
+                }
+                if let Some(i) = delete_idx {
+                    self.delete_project(i);
+                }
+            });
+
             // ── Additional search roots ────────────────────────────────
             let mut remove_root_idx: Option<usize> = None;
             for (i, root) in self.params.roots.iter_mut().enumerate() {
@@ -3328,6 +3393,35 @@ impl GrepApp {
             }
         }
         vals
+    }
+
+    /// Whether `self.params` currently matches a saved project's scope
+    /// (#21) — used to highlight the active project chip.
+    fn matches_project(&self, project: &Project) -> bool {
+        self.params.matches_project(project)
+    }
+
+    /// Applies a saved project's roots + filters to the current search form.
+    fn load_project(&mut self, project: &Project) {
+        self.params.apply_project(project);
+    }
+
+    /// Saves the current directory/roots/filters as a new named project.
+    /// No-op on a blank name (trimmed).
+    fn save_current_as_project(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.config.projects.push(self.params.to_project(name));
+        let _ = self.config.save();
+    }
+
+    fn delete_project(&mut self, idx: usize) {
+        if idx < self.config.projects.len() {
+            self.config.projects.remove(idx);
+            let _ = self.config.save();
+        }
     }
 
     /// Icon toggle button with tooltip (used for Settings / History / Replace).
@@ -6240,9 +6334,11 @@ impl GrepApp {
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Your presets will be kept. This cannot be undone.")
-                    .color(pal.subtext)
-                    .size(11.0),
+                RichText::new(
+                    "Your presets and saved projects will be kept. This cannot be undone.",
+                )
+                .color(pal.subtext)
+                .size(11.0),
             );
             ui.add_space(12.0);
             ui.separator();
@@ -6265,6 +6361,53 @@ impl GrepApp {
                     .clicked()
                 {
                     self.show_reset_settings_confirm = false;
+                }
+            });
+        });
+    }
+
+    fn show_save_project_window(&mut self, ui: &mut Ui) {
+        let pal = self.pal;
+        ui.vertical(|ui| {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Save the current directory, roots, and type/exclude filters")
+                    .color(pal.subtext)
+                    .size(11.0),
+            );
+            ui.add_space(8.0);
+            let name_resp = ui.add(
+                egui::TextEdit::singleline(&mut self.project_new_name)
+                    .hint_text("Project name")
+                    .desired_width(240.0),
+            );
+            if self.focus_project_name {
+                name_resp.request_focus();
+                self.focus_project_name = false;
+            }
+            let can_save = !self.project_new_name.trim().is_empty();
+            let submit = name_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let clicked_save = ui
+                    .add_enabled(
+                        can_save,
+                        egui::Button::new(RichText::new("Save").color(pal.bg_mantle).size(13.0))
+                            .fill(pal.accent),
+                    )
+                    .clicked();
+                if (clicked_save || submit) && can_save {
+                    let name = self.project_new_name.clone();
+                    self.save_current_as_project(&name);
+                    self.show_save_project_popup = false;
+                }
+                if ui
+                    .button(RichText::new("Cancel").color(pal.subtext).size(13.0))
+                    .clicked()
+                {
+                    self.show_save_project_popup = false;
                 }
             });
         });
@@ -7793,17 +7936,12 @@ fn show_filter_flags(
     (Some(inc_resp), inc_filtered, Some(exc_resp), exc_filtered)
 }
 
-/// Renders a Type-preset chip with correct paint order (background drawn before text).
-/// Using `painter.rect_filled()` after `ui.add(label)` would draw the rect ON TOP of
-/// the text, hiding it. This helper allocates the rect first, paints bg, then paints text.
-fn preset_chip(
-    ui: &mut Ui,
-    pal: Pal,
-    label: &str,
-    active: bool,
-    tooltip: &str,
-    on_click: impl FnOnce(),
-) {
+/// Renders a chip with correct paint order (background drawn before text) and
+/// returns its `Response` so callers can chain `.on_hover_text()`,
+/// `.context_menu()`, etc. Using `painter.rect_filled()` after `ui.add(label)`
+/// would draw the rect ON TOP of the text, hiding it — this allocates the
+/// rect first, paints bg, then paints text.
+fn chip_response(ui: &mut Ui, pal: Pal, label: &str, active: bool) -> egui::Response {
     let font_id = egui::FontId::new(11.0, egui::FontFamily::Proportional);
     let text_color = if active { pal.accent } else { pal.subtext };
     let galley = ui
@@ -7811,7 +7949,6 @@ fn preset_chip(
         .layout_no_wrap(label.to_string(), font_id, text_color);
     let padding = Vec2::new(4.0, 2.0);
     let (rect, resp) = ui.allocate_exact_size(galley.size() + padding * 2.0, egui::Sense::click());
-    let resp = resp.on_hover_text(tooltip);
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if active || resp.hovered() {
@@ -7827,6 +7964,19 @@ fn preset_chip(
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    resp
+}
+
+/// Type-preset chip: `chip_response` plus a hover tooltip and click callback.
+fn preset_chip(
+    ui: &mut Ui,
+    pal: Pal,
+    label: &str,
+    active: bool,
+    tooltip: &str,
+    on_click: impl FnOnce(),
+) {
+    let resp = chip_response(ui, pal, label, active).on_hover_text(tooltip);
     if resp.clicked() {
         on_click();
     }
