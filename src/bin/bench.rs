@@ -42,9 +42,6 @@ fn main() {
     let no_limit = args.iter().any(|a| a == "--no-limit");
 
     let config = Config {
-        max_threads: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4),
         max_result_files: if no_limit {
             0
         } else {

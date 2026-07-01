@@ -276,6 +276,7 @@ pub struct GrepApp {
     replace_confirm_matches: usize,
     replace_confirm_snapshot: Option<Vec<FileMatch>>,
     show_shortcuts: bool,
+    show_reset_settings_confirm: bool,
 
     focused_pane: FocusedPane,
     current_match: Option<(usize, usize)>, // (file_index, line_match_index)
@@ -376,6 +377,7 @@ impl GrepApp {
             replace_confirm_matches: 0,
             replace_confirm_snapshot: None,
             show_shortcuts: false,
+            show_reset_settings_confirm: false,
             focused_pane: FocusedPane::FileList,
             current_match: None,
             scroll_to_current: false,
@@ -1551,9 +1553,11 @@ impl eframe::App for GrepApp {
         self.ensure_theme_applied(&ctx);
 
         // Disable global shortcuts when any modal/subwindow is open
-        let modal_open =
-            self.show_replace_confirm || self.show_shortcuts || self.replace_preview.is_some();
-        let enabled = !self.show_replace_confirm;
+        let modal_open = self.show_replace_confirm
+            || self.show_shortcuts
+            || self.replace_preview.is_some()
+            || self.show_reset_settings_confirm;
+        let enabled = !self.show_replace_confirm && !self.show_reset_settings_confirm;
 
         // ── Global keyboard shortcuts ──────────────────────────────────────────
         let mut next_match_req = false;
@@ -1595,6 +1599,7 @@ impl eframe::App for GrepApp {
                     self.show_shortcuts = false;
                     self.show_replace_confirm = false;
                     self.replace_confirm_snapshot = None;
+                    self.show_reset_settings_confirm = false;
                     if self.replace_preview.is_some() {
                         self.replace_preview = None;
                     } else if self.is_settings_active() {
@@ -2118,6 +2123,18 @@ impl eframe::App for GrepApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(&ctx, |ui| {
                     self.show_replace_confirm_window(ui);
+                });
+        }
+
+        if self.show_reset_settings_confirm {
+            egui::Window::new("Reset Settings")
+                .collapsible(false)
+                .resizable(false)
+                .max_width(max_w)
+                .max_height(max_h)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    self.show_reset_settings_confirm_window(ui);
                 });
         }
 
@@ -4705,6 +4722,7 @@ impl GrepApp {
             // animated scroll-to-cursor). See #16 design note.
             ScrollArea::vertical()
                 .auto_shrink([false; 2])
+                .animated(!self.config.reduce_motion)
                 .show(ui, |ui| {
                     ui.add_space(4.0);
                     // Render rows flush against each other; the default vertical
@@ -5041,9 +5059,16 @@ impl GrepApp {
         // ── Tab bar ───────────────────────────────────────────────────
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-            for (idx, label) in ["Appearance", "Search", "Editor", "Presets", "Export"]
-                .iter()
-                .enumerate()
+            for (idx, label) in [
+                "Appearance",
+                "Search",
+                "Replace",
+                "Editor",
+                "Presets",
+                "Export",
+            ]
+            .iter()
+            .enumerate()
             {
                 let idx = idx as u8;
                 let active = self.settings_tab == idx;
@@ -5121,15 +5146,114 @@ impl GrepApp {
                 settings_row(ui, pal, "Word wrap", |ui| {
                     ui.checkbox(&mut self.config.wrap_lines, "Wrap long lines");
                 });
-                settings_row(ui, pal, "Reduce motion", |ui| {
-                    ui.checkbox(
-                        &mut self.config.reduce_motion,
-                        "Disable transitions & fades",
-                    );
+                settings_row(ui, pal, "Animations", |ui| {
+                    let mut animations_enabled = !self.config.reduce_motion;
+                    if ui
+                        .checkbox(&mut animations_enabled, "Enable transitions & fades")
+                        .changed()
+                    {
+                        self.config.reduce_motion = !animations_enabled;
+                    }
                 });
             }
             1 => {
-                // ── Search ────────────────────────────────────────────
+                // ── Search ──────────────────────────────────────────────
+                settings_group_header(ui, pal, "Scope");
+                settings_row(ui, pal, "Respect .gitignore", |ui| {
+                    ui.checkbox(&mut self.config.respect_gitignore, "Skip gitignored paths");
+                });
+                settings_row(ui, pal, "Search hidden files", |ui| {
+                    let r = ui.checkbox(
+                        &mut self.config.search_hidden,
+                        "Include dotfiles and hidden directories",
+                    );
+                    if r.changed() {
+                        let _ = self.config.save();
+                    }
+                });
+                settings_row(ui, pal, "Follow symlinks", |ui| {
+                    let r = ui.checkbox(
+                        &mut self.config.follow_symlinks,
+                        "Follow symbolic links (may be slower; watch for cycles)",
+                    );
+                    if r.changed() {
+                        let _ = self.config.save();
+                    }
+                });
+                settings_row(ui, pal, "Default excludes", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.config.default_exclude_dirs)
+                            .hint_text(
+                                RichText::new(".git,target,node_modules")
+                                    .color(pal.placeholder)
+                                    .italics(),
+                            )
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text(
+                        "Directory names to always skip (comma-separated), applied on top of \
+                         the per-search Exclude field.\n\
+                         Bare directory names only (e.g. node_modules, target, *cache*) — \
+                         matched against the directory's own name and pruned at any depth. \
+                         Does NOT take file globs or dir/*.ext path patterns (use the \
+                         per-search Exclude field for those).",
+                    );
+                });
+                settings_row(ui, pal, "Search encoding", |ui| {
+                    let options = [
+                        ("auto", "Auto (BOM sniff)"),
+                        ("UTF-8", "UTF-8"),
+                        ("shift_jis", "Shift-JIS"),
+                        ("euc-jp", "EUC-JP"),
+                        ("utf-16le", "UTF-16LE"),
+                        ("utf-16be", "UTF-16BE"),
+                        ("windows-1252", "Latin-1 (Win)"),
+                    ];
+                    let current_label = options
+                        .iter()
+                        .find(|(v, _)| *v == self.config.search_encoding)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Auto (BOM sniff)");
+                    egui::ComboBox::from_id_salt("search_encoding")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for (value, label) in &options {
+                                let selected = self.config.search_encoding == *value;
+                                if ui.selectable_label(selected, *label).clicked() {
+                                    self.config.search_encoding = value.to_string();
+                                    let _ = self.config.save();
+                                }
+                            }
+                        });
+                });
+
+                settings_group_header(ui, pal, "Limits");
+                settings_row(ui, pal, "Max file size (MB)", |ui| {
+                    ui.add(egui::Slider::new(
+                        &mut self.config.max_file_size_mb,
+                        1..=500,
+                    ));
+                });
+                settings_row(ui, pal, "Limit result files", |ui| {
+                    let mut limit_enabled = self.config.max_result_files != 0;
+                    if ui.checkbox(&mut limit_enabled, "").changed() {
+                        if limit_enabled {
+                            self.config.max_result_files = 2000;
+                        } else {
+                            self.config.max_result_files = 0;
+                        }
+                    }
+                    if limit_enabled {
+                        ui.add(egui::Slider::new(
+                            &mut self.config.max_result_files,
+                            100..=10000,
+                        ));
+                    } else {
+                        ui.label(RichText::new("Unlimited").color(pal.muted));
+                    }
+                });
+
+                settings_group_header(ui, pal, "History");
                 settings_row(ui, pal, "Search history", |ui| {
                     for mode in [HistoryMode::Auto, HistoryMode::Manual, HistoryMode::Off] {
                         let active = self.config.history_mode == mode;
@@ -5158,45 +5282,9 @@ impl GrepApp {
                 settings_row(ui, pal, "History limit", |ui| {
                     ui.add(egui::Slider::new(&mut self.config.history_limit, 1..=1000));
                 });
-                settings_row(ui, pal, "Search threads", |ui| {
-                    ui.checkbox(&mut self.config.auto_threads, "Auto");
-                    if !self.config.auto_threads {
-                        ui.add(egui::Slider::new(&mut self.config.max_threads, 1..=16));
-                    } else {
-                        let n = std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4);
-                        ui.label(
-                            RichText::new(format!("({n} detected)"))
-                                .color(pal.muted)
-                                .size(11.0),
-                        );
-                    }
-                });
-                settings_row(ui, pal, "Max file size (MB)", |ui| {
-                    ui.add(egui::Slider::new(
-                        &mut self.config.max_file_size_mb,
-                        1..=500,
-                    ));
-                });
-                settings_row(ui, pal, "Limit result files", |ui| {
-                    let mut limit_enabled = self.config.max_result_files != 0;
-                    if ui.checkbox(&mut limit_enabled, "").changed() {
-                        if limit_enabled {
-                            self.config.max_result_files = 2000;
-                        } else {
-                            self.config.max_result_files = 0;
-                        }
-                    }
-                    if limit_enabled {
-                        ui.add(egui::Slider::new(
-                            &mut self.config.max_result_files,
-                            100..=10000,
-                        ));
-                    } else {
-                        ui.label(RichText::new("Unlimited").color(pal.muted));
-                    }
-                });
+            }
+            2 => {
+                // ── Replace ───────────────────────────────────────────
                 settings_row(ui, pal, "Backup on replace", |ui| {
                     ui.checkbox(&mut self.config.backup_before_replace, "Enable backups");
                 });
@@ -5233,75 +5321,8 @@ impl GrepApp {
                         );
                     });
                 }
-                settings_row(ui, pal, "Search encoding", |ui| {
-                    let options = [
-                        ("auto", "Auto (BOM sniff)"),
-                        ("UTF-8", "UTF-8"),
-                        ("shift_jis", "Shift-JIS"),
-                        ("euc-jp", "EUC-JP"),
-                        ("utf-16le", "UTF-16LE"),
-                        ("utf-16be", "UTF-16BE"),
-                        ("windows-1252", "Latin-1 (Win)"),
-                    ];
-                    let current_label = options
-                        .iter()
-                        .find(|(v, _)| *v == self.config.search_encoding)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("Auto (BOM sniff)");
-                    egui::ComboBox::from_id_salt("search_encoding")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            for (value, label) in &options {
-                                let selected = self.config.search_encoding == *value;
-                                if ui.selectable_label(selected, *label).clicked() {
-                                    self.config.search_encoding = value.to_string();
-                                    let _ = self.config.save();
-                                }
-                            }
-                        });
-                });
-                settings_row(ui, pal, "Respect .gitignore", |ui| {
-                    ui.checkbox(&mut self.config.respect_gitignore, "Skip gitignored paths");
-                });
-                settings_row(ui, pal, "Follow symlinks", |ui| {
-                    let r = ui.checkbox(
-                        &mut self.config.follow_symlinks,
-                        "Follow symbolic links (may be slower; watch for cycles)",
-                    );
-                    if r.changed() {
-                        let _ = self.config.save();
-                    }
-                });
-                settings_row(ui, pal, "Search hidden files", |ui| {
-                    let r = ui.checkbox(
-                        &mut self.config.search_hidden,
-                        "Include dotfiles and hidden directories",
-                    );
-                    if r.changed() {
-                        let _ = self.config.save();
-                    }
-                });
-                settings_row(ui, pal, "Default excludes", |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.config.default_exclude_dirs)
-                            .hint_text(
-                                RichText::new(".git,target,node_modules")
-                                    .color(pal.placeholder)
-                                    .italics(),
-                            )
-                            .desired_width(f32::INFINITY),
-                    )
-                    .on_hover_text(
-                        "Directory names to always skip (comma-separated), applied on top of \
-                         the per-search Exclude field.\n\
-                         Bare directory names only (e.g. node_modules, target, *cache*) — \
-                         matched against the directory's own name and pruned at any depth. \
-                         Does NOT take file globs or dir/*.ext path patterns (use the \
-                         per-search Exclude field for those).",
-                    );
-                });
             }
-            2 => {
+            3 => {
                 // ── Editor ────────────────────────────────────────────
                 settings_row(ui, pal, "Command", |ui| {
                     ui.add(
@@ -5345,7 +5366,7 @@ impl GrepApp {
                     );
                 });
             }
-            3 => {
+            4 => {
                 // ── Presets ───────────────────────────────────────────
                 let last_hovered_idx = self.dnd_hovered_preset_idx;
                 self.dnd_hovered_preset_idx = None;
@@ -5875,7 +5896,7 @@ impl GrepApp {
                     }
                 });
             }
-            4 => {
+            5 => {
                 // ── Export ────────────────────────────────────────────
                 ui.horizontal(|ui| {
                     ui.label(
@@ -6091,6 +6112,55 @@ impl GrepApp {
             {
                 self.close_settings_tab();
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(RichText::new("Reset to defaults").color(pal.red).size(12.0))
+                    .clicked()
+                {
+                    self.show_reset_settings_confirm = true;
+                }
+            });
+        });
+    }
+
+    fn show_reset_settings_confirm_window(&mut self, ui: &mut Ui) {
+        let pal = self.pal;
+        ui.vertical(|ui| {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Reset all settings to their defaults?")
+                    .size(13.0)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Your presets will be kept. This cannot be undone.")
+                    .color(pal.subtext)
+                    .size(11.0),
+            );
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Reset").color(pal.bg_mantle).size(13.0))
+                            .fill(pal.red),
+                    )
+                    .clicked()
+                {
+                    self.config.reset_preserving_presets();
+                    self.history.set_limit(self.config.history_limit);
+                    let _ = self.config.save();
+                    self.show_reset_settings_confirm = false;
+                }
+                if ui
+                    .button(RichText::new("Cancel").color(pal.subtext).size(13.0))
+                    .clicked()
+                {
+                    self.show_reset_settings_confirm = false;
+                }
+            });
         });
     }
 
@@ -7362,6 +7432,14 @@ fn toggle_selection(set: &mut BTreeSet<PathBuf>, path: &Path) {
     } else {
         set.insert(path.to_path_buf());
     }
+}
+
+/// A muted, slightly larger sub-header used to group related settings rows
+/// within a tab (e.g. "Scope" / "Limits" / "History" in the Search tab, #29).
+fn settings_group_header(ui: &mut Ui, pal: Pal, label: &str) {
+    ui.add_space(10.0);
+    ui.label(RichText::new(label).color(pal.muted).size(13.0).strong());
+    ui.add_space(4.0);
 }
 
 fn settings_row(ui: &mut Ui, pal: Pal, label: &str, content: impl FnOnce(&mut Ui)) {

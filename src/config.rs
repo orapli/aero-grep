@@ -92,10 +92,6 @@ fn default_backup_retention_days() -> usize {
     7
 }
 
-fn default_auto_threads() -> bool {
-    true
-}
-
 fn default_search_encoding() -> String {
     "auto".to_string()
 }
@@ -225,9 +221,6 @@ fn default_export_header_enabled() -> bool {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub history_limit: usize,
-    pub max_threads: usize,
-    #[serde(default = "default_auto_threads")]
-    pub auto_threads: bool,
     pub max_file_size_mb: u64,
     #[serde(default)]
     pub editor_command: String,
@@ -287,8 +280,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             history_limit: 100,
-            max_threads: 4,
-            auto_threads: true,
             max_file_size_mb: 50,
             editor_command: String::new(),
             theme: Theme::default(),
@@ -320,16 +311,6 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn effective_threads(&self) -> usize {
-        if self.auto_threads {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        } else {
-            self.max_threads.max(1)
-        }
-    }
-
     pub fn config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("aero-grep").join("config.json"))
     }
@@ -337,7 +318,13 @@ impl Config {
     fn clamp_values(&mut self) {
         self.font_size = self.font_size.clamp(10.0, 24.0);
         self.history_limit = self.history_limit.clamp(1, 1000);
-        self.max_threads = self.max_threads.clamp(1, 16);
+    }
+
+    /// Resets to defaults while keeping user-created presets (#29).
+    pub fn reset_preserving_presets(&mut self) {
+        let presets = std::mem::take(&mut self.presets);
+        *self = Self::default();
+        self.presets = presets;
     }
 
     pub fn load() -> Self {
@@ -375,7 +362,6 @@ mod tests {
         let original = Config::default();
         let json = serde_json::to_string(&original).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(original.max_threads, restored.max_threads);
         assert_eq!(original.respect_gitignore, restored.respect_gitignore);
         assert_eq!(original.max_result_files, restored.max_result_files);
         assert_eq!(original.backup_dir, restored.backup_dir);
@@ -445,7 +431,6 @@ mod tests {
         let mut cfg = Config {
             font_size: 5.0,
             history_limit: 0,
-            max_threads: 999,
             ..Config::default()
         };
 
@@ -453,17 +438,38 @@ mod tests {
 
         assert_eq!(cfg.font_size, 10.0);
         assert_eq!(cfg.history_limit, 1);
-        assert_eq!(cfg.max_threads, 16);
 
         // Another set of out of bounds values
         cfg.font_size = 50.0;
         cfg.history_limit = 2000;
-        cfg.max_threads = 0;
 
         cfg.clamp_values();
 
         assert_eq!(cfg.font_size, 24.0);
         assert_eq!(cfg.history_limit, 1000);
-        assert_eq!(cfg.max_threads, 1);
+    }
+
+    #[test]
+    fn test_reset_preserving_presets_keeps_presets_resets_rest() {
+        let mut cfg = Config {
+            font_size: 20.0,
+            history_limit: 500,
+            respect_gitignore: false,
+            presets: vec![Preset {
+                name: "Custom".to_string(),
+                glob: "*.custom".to_string(),
+                enabled: true,
+            }],
+            ..Config::default()
+        };
+
+        cfg.reset_preserving_presets();
+
+        let defaults = Config::default();
+        assert_eq!(cfg.font_size, defaults.font_size);
+        assert_eq!(cfg.history_limit, defaults.history_limit);
+        assert_eq!(cfg.respect_gitignore, defaults.respect_gitignore);
+        assert_eq!(cfg.presets.len(), 1);
+        assert_eq!(cfg.presets[0].name, "Custom");
     }
 }

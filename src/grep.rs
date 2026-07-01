@@ -12,6 +12,15 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Single source of truth for search parallelism: always the logical CPU
+/// count (#29 dropped the manual thread-cap setting since it never beat
+/// this in the default/only mode).
+fn auto_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 fn escape_pattern(params: &SearchParams) -> String {
     if params.is_regex {
         params.pattern.clone()
@@ -362,7 +371,7 @@ pub fn search(
         .git_exclude(config.respect_gitignore)
         .hidden(!config.search_hidden)
         .follow_links(config.follow_symlinks)
-        .threads(config.effective_threads());
+        .threads(auto_thread_count());
     if let Some(depth) = params.max_depth {
         if depth > 0 {
             builder.max_depth(Some(depth));
@@ -462,7 +471,7 @@ pub fn search(
     total.store(files.len(), std::sync::atomic::Ordering::Relaxed);
 
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(config.effective_threads())
+        .num_threads(auto_thread_count())
         .build()
         .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
@@ -608,7 +617,6 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            max_threads: 2,
             max_file_size_mb: 50,
             respect_gitignore: false,
             default_exclude_dirs: String::new(),
