@@ -9,6 +9,7 @@ use egui::{
     text::LayoutJob, Color32, CornerRadius, FontId, Margin, RichText, ScrollArea, Stroke,
     TextFormat, Ui, Vec2,
 };
+use regex::Regex;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -186,10 +187,14 @@ enum PaletteAction {
 }
 
 // ── Result tab ────────────────────────────────────────────────────────────────
-#[derive(Clone)]
-struct ResultTab {
-    is_settings: bool,
-    result: Option<SearchResult>,
+/// The subset of per-tab navigation state that must round-trip identically
+/// across `save_active_tab`/`switch_to_tab`/`update_active_tab`/
+/// `new_empty_tab` — previously a "SYNC CONTRACT" enforced only by a
+/// comment, duplicated field-by-field in four places. Extracted into one
+/// struct (#18) so the mirroring is structural, and so
+/// `save_tab_nav`/`load_tab_nav` are unit-testable without an egui context.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TabNavState {
     selected_files: BTreeSet<PathBuf>,
     collapsed_files: BTreeSet<PathBuf>,
     view_mode: ViewMode,
@@ -197,6 +202,30 @@ struct ResultTab {
     content_filter: String,
     current_match: Option<(usize, usize)>,
     scroll_to_current: bool,
+}
+
+/// Copies `nav` into the active tab's stored state, if any. Pure aside from
+/// the `&mut` write; mirrors what `GrepApp::save_active_tab` does for the
+/// tab-navigation fields (the result/params side is out of scope here).
+fn save_tab_nav(tabs: &mut [ResultTab], active_tab: Option<usize>, nav: &TabNavState) {
+    if let Some(idx) = active_tab {
+        if let Some(tab) = tabs.get_mut(idx) {
+            tab.nav = nav.clone();
+        }
+    }
+}
+
+/// Reads tab `idx`'s stored nav state back out. Mirrors what
+/// `GrepApp::switch_to_tab` does for the tab-navigation fields.
+fn load_tab_nav(tabs: &[ResultTab], idx: usize) -> TabNavState {
+    tabs[idx].nav.clone()
+}
+
+#[derive(Clone)]
+struct ResultTab {
+    is_settings: bool,
+    result: Option<SearchResult>,
+    nav: TabNavState,
 }
 
 /// Bulk tab-close action triggered from a tab's right-click context menu.
@@ -411,35 +440,41 @@ impl GrepApp {
 
     // ── Tab management ────────────────────────────────────────────────────────
 
-    // SYNC CONTRACT: the six fields below must stay identical in
-    // save_active_tab (mirror→tab), switch_to_tab (tab→mirror), and
-    // update_active_tab (mirror→new-tab). Add new per-tab nav fields here first.
-    fn save_active_tab(&mut self) {
-        if let Some(idx) = self.active_tab {
-            if let Some(tab) = self.tabs.get_mut(idx) {
-                tab.selected_files = self.selected_files.clone();
-                tab.collapsed_files = self.collapsed_files.clone();
-                tab.view_mode = self.view_mode.clone();
-                tab.file_filter = self.file_filter.clone();
-                tab.content_filter = self.content_filter.clone();
-                tab.current_match = self.current_match;
-                tab.scroll_to_current = self.scroll_to_current;
-            }
+    /// Snapshots the live tab-navigation fields (scattered across `self`
+    /// for direct per-frame access elsewhere) into one `TabNavState`.
+    fn current_nav_state(&self) -> TabNavState {
+        TabNavState {
+            selected_files: self.selected_files.clone(),
+            collapsed_files: self.collapsed_files.clone(),
+            view_mode: self.view_mode.clone(),
+            file_filter: self.file_filter.clone(),
+            content_filter: self.content_filter.clone(),
+            current_match: self.current_match,
+            scroll_to_current: self.scroll_to_current,
         }
+    }
+
+    /// Writes a `TabNavState` back out into the live, scattered fields.
+    fn apply_nav_state(&mut self, nav: TabNavState) {
+        self.selected_files = nav.selected_files;
+        self.collapsed_files = nav.collapsed_files;
+        self.view_mode = nav.view_mode;
+        self.file_filter = nav.file_filter;
+        self.content_filter = nav.content_filter;
+        self.current_match = nav.current_match;
+        self.scroll_to_current = nav.scroll_to_current;
+    }
+
+    fn save_active_tab(&mut self) {
+        let nav = self.current_nav_state();
+        save_tab_nav(&mut self.tabs, self.active_tab, &nav);
     }
 
     fn switch_to_tab(&mut self, idx: usize) {
         self.save_active_tab();
-        let tab = &self.tabs[idx];
-        self.current_result = tab.result.clone();
-        self.selected_files = tab.selected_files.clone();
-        self.collapsed_files = tab.collapsed_files.clone();
-        self.view_mode = tab.view_mode.clone();
-        self.file_filter = tab.file_filter.clone();
-        self.content_filter = tab.content_filter.clone();
-        self.current_match = tab.current_match;
-        self.scroll_to_current = tab.scroll_to_current;
-        if let Some(result) = &tab.result {
+        self.current_result = self.tabs[idx].result.clone();
+        self.apply_nav_state(load_tab_nav(&self.tabs, idx));
+        if let Some(result) = &self.current_result {
             self.params = result.params.clone();
         }
         self.active_tab = Some(idx);
@@ -466,49 +501,27 @@ impl GrepApp {
         let tab = ResultTab {
             is_settings: false,
             result: None,
-            selected_files: BTreeSet::new(),
-            collapsed_files: BTreeSet::new(),
-            view_mode: ViewMode::Tree,
-            file_filter: String::new(),
-            content_filter: String::new(),
-            current_match: None,
-            scroll_to_current: false,
+            nav: TabNavState::default(),
         };
         self.tabs.push(tab);
         self.active_tab = Some(self.tabs.len() - 1);
         self.current_result = None;
-        self.selected_files.clear();
-        self.collapsed_files.clear();
-        self.file_filter.clear();
-        self.content_filter.clear();
-        self.current_match = None;
-        self.scroll_to_current = false;
+        self.apply_nav_state(TabNavState::default());
     }
 
     fn update_active_tab(&mut self, result: SearchResult) {
         self.current_result = Some(result.clone());
+        let nav = self.current_nav_state();
         if let Some(idx) = self.active_tab {
             if let Some(tab) = self.tabs.get_mut(idx) {
                 tab.result = Some(result);
-                tab.selected_files = self.selected_files.clone();
-                tab.collapsed_files = self.collapsed_files.clone();
-                tab.view_mode = self.view_mode.clone();
-                tab.file_filter = self.file_filter.clone();
-                tab.content_filter = self.content_filter.clone();
-                tab.current_match = self.current_match;
-                tab.scroll_to_current = self.scroll_to_current;
+                tab.nav = nav;
             }
         } else {
             let tab = ResultTab {
                 is_settings: false,
                 result: Some(result),
-                selected_files: self.selected_files.clone(),
-                collapsed_files: self.collapsed_files.clone(),
-                view_mode: self.view_mode.clone(),
-                file_filter: self.file_filter.clone(),
-                content_filter: self.content_filter.clone(),
-                current_match: self.current_match,
-                scroll_to_current: self.scroll_to_current,
+                nav,
             };
             self.tabs.push(tab);
             self.active_tab = Some(0);
@@ -523,13 +536,7 @@ impl GrepApp {
         if self.tabs.is_empty() {
             self.active_tab = None;
             self.current_result = None;
-            self.selected_files.clear();
-            self.collapsed_files.clear();
-            self.view_mode = ViewMode::Tree;
-            self.file_filter.clear();
-            self.content_filter.clear();
-            self.current_match = None;
-            self.scroll_to_current = false;
+            self.apply_nav_state(TabNavState::default());
         } else {
             let n = self.tabs.len();
             let new_idx = self
@@ -547,12 +554,7 @@ impl GrepApp {
         self.tabs.clear();
         self.active_tab = None;
         self.current_result = None;
-        self.selected_files.clear();
-        self.collapsed_files.clear();
-        self.view_mode = ViewMode::Tree;
-        self.file_filter.clear();
-        self.current_match = None;
-        self.scroll_to_current = false;
+        self.apply_nav_state(TabNavState::default());
         self.scroll_to_file = None;
     }
 
@@ -616,24 +618,13 @@ impl GrepApp {
         let tab = ResultTab {
             is_settings: true,
             result: None,
-            selected_files: BTreeSet::new(),
-            collapsed_files: BTreeSet::new(),
-            view_mode: ViewMode::Tree,
-            file_filter: String::new(),
-            content_filter: String::new(),
-            current_match: None,
-            scroll_to_current: false,
+            nav: TabNavState::default(),
         };
         self.tabs.push(tab);
         let new_idx = self.tabs.len() - 1;
         self.active_tab = Some(new_idx);
         self.current_result = None;
-        self.selected_files.clear();
-        self.collapsed_files.clear();
-        self.file_filter.clear();
-        self.content_filter.clear();
-        self.current_match = None;
-        self.scroll_to_current = false;
+        self.apply_nav_state(TabNavState::default());
     }
 
     fn close_settings_tab(&mut self) {
@@ -857,9 +848,7 @@ impl GrepApp {
                     self.switch_to_tab(idx);
                 } else {
                     self.current_result = None;
-                    self.selected_files.clear();
-                    self.current_match = None;
-                    self.scroll_to_current = false;
+                    self.apply_nav_state(TabNavState::default());
                 }
             }
             _ => {}
@@ -1176,38 +1165,19 @@ impl GrepApp {
         let config = self.config.clone();
 
         if let Ok(regex) = build_regex(&params) {
-            let mut ok = 0usize;
-            let mut err = 0usize;
-            let mut replaced_instances = 0usize;
             let session_dir_name = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
             let backup_root = std::path::Path::new(&config.backup_dir);
-
-            for fm in &files {
-                if config.backup_before_replace {
-                    if let Err(e) =
-                        crate::grep::backup_file_to(&fm.path, backup_root, &session_dir_name)
-                    {
-                        self.status_msg = format!("Backup failed for {}: {}", fm.path.display(), e);
-                        err += 1;
-                        continue;
-                    }
-                }
-
-                match apply_replace(fm, &regex, &params.replace_text) {
-                    Ok((new_content, actual_count)) => {
-                        if std::fs::write(&fm.path, new_content).is_ok() {
-                            ok += 1;
-                            replaced_instances += actual_count;
-                        } else {
-                            err += 1;
-                        }
-                    }
-                    Err(_) => err += 1,
-                }
-            }
+            let summary = run_replace_all(
+                &files,
+                &regex,
+                &params.replace_text,
+                config.backup_before_replace,
+                backup_root,
+                &session_dir_name,
+            );
             self.status_msg = format!(
                 "Replaced {} instances in {} files ({} errors)",
-                replaced_instances, ok, err
+                summary.replaced_instances, summary.ok, summary.err
             );
         }
         self.replace_confirm_snapshot = None;
@@ -1226,6 +1196,55 @@ impl GrepApp {
     ) -> String {
         format_matches_to_string_impl(&self.config, files, params)
     }
+}
+
+/// Outcome of a `run_replace_all` pass: files rewritten successfully; files
+/// that failed (backup or write failure); total match instances actually
+/// replaced (from the real, current file content — see #7).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReplaceSummary {
+    ok: usize,
+    err: usize,
+    replaced_instances: usize,
+}
+
+/// Pure orchestration of a Replace-All run over `files`: for each file,
+/// optionally back it up, then apply `regex` → `replace_text` and write the
+/// result. No egui/`GrepApp` dependency (#18), so this is directly
+/// unit-testable against temp dirs — mirrors `execute_replace`'s per-file
+/// loop exactly (that method just reports `ReplaceSummary` as a status
+/// string). `apply_replace`/`backup_file_to` themselves are already tested
+/// in `grep.rs`; this covers the per-file loop + counting around them.
+fn run_replace_all(
+    files: &[FileMatch],
+    regex: &Regex,
+    replace_text: &str,
+    backup_before_replace: bool,
+    backup_root: &Path,
+    session_dir_name: &str,
+) -> ReplaceSummary {
+    let mut summary = ReplaceSummary::default();
+    for fm in files {
+        if backup_before_replace
+            && crate::grep::backup_file_to(&fm.path, backup_root, session_dir_name).is_err()
+        {
+            summary.err += 1;
+            continue;
+        }
+
+        match apply_replace(fm, regex, replace_text) {
+            Ok((new_content, actual_count)) => {
+                if std::fs::write(&fm.path, new_content).is_ok() {
+                    summary.ok += 1;
+                    summary.replaced_instances += actual_count;
+                } else {
+                    summary.err += 1;
+                }
+            }
+            Err(_) => summary.err += 1,
+        }
+    }
+    summary
 }
 
 fn format_global_header(config: &Config, params: &crate::models::SearchParams) -> String {
@@ -7667,6 +7686,235 @@ fn format_ts(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #18: tab-navigation-state mirroring (save_tab_nav / load_tab_nav),
+    // tested directly against ResultTab/TabNavState with no GrepApp/eframe
+    // context needed.
+    fn sample_nav(marker: &str) -> TabNavState {
+        TabNavState {
+            selected_files: [PathBuf::from(marker)].into_iter().collect(),
+            collapsed_files: BTreeSet::new(),
+            view_mode: ViewMode::Flat,
+            file_filter: marker.to_string(),
+            content_filter: String::new(),
+            current_match: Some((0, 0)),
+            scroll_to_current: false,
+        }
+    }
+
+    fn plain_tab(nav: TabNavState) -> ResultTab {
+        ResultTab {
+            is_settings: false,
+            result: None,
+            nav,
+        }
+    }
+
+    #[test]
+    fn test_save_tab_nav_writes_into_active_tab() {
+        let mut tabs = vec![plain_tab(TabNavState::default())];
+        let nav = sample_nav("a");
+        save_tab_nav(&mut tabs, Some(0), &nav);
+        assert_eq!(tabs[0].nav, nav);
+    }
+
+    #[test]
+    fn test_save_tab_nav_noop_when_no_active_tab() {
+        let mut tabs = vec![plain_tab(TabNavState::default())];
+        save_tab_nav(&mut tabs, None, &sample_nav("a"));
+        assert_eq!(tabs[0].nav, TabNavState::default());
+    }
+
+    #[test]
+    fn test_load_tab_nav_reads_back_exact_state() {
+        let tabs = vec![plain_tab(sample_nav("b"))];
+        let loaded = load_tab_nav(&tabs, 0);
+        assert_eq!(loaded, sample_nav("b"));
+    }
+
+    #[test]
+    fn test_tab_nav_round_trip_a_to_b_to_a_preserves_each() {
+        // Simulates switching tab A -> B -> A (the "SYNC CONTRACT") and
+        // asserts each tab's nav state survives the round trip unmodified,
+        // including edits made while on the other tab.
+        let mut tabs = vec![plain_tab(sample_nav("A")), plain_tab(sample_nav("B"))];
+
+        // Leaving tab A: save whatever the "current" (live) nav was.
+        save_tab_nav(&mut tabs, Some(0), &sample_nav("A"));
+
+        // Switch to B: load its stored nav.
+        let nav_b = load_tab_nav(&tabs, 1);
+        assert_eq!(nav_b, sample_nav("B"));
+
+        // ...user edits something while on B...
+        let edited_b = TabNavState {
+            file_filter: "B-edited".to_string(),
+            ..nav_b
+        };
+        // Leaving B: save the edited state back.
+        save_tab_nav(&mut tabs, Some(1), &edited_b);
+        assert_eq!(tabs[1].nav, edited_b);
+
+        // Switch back to A: load it, unaffected by B's edits.
+        let nav_a = load_tab_nav(&tabs, 0);
+        assert_eq!(nav_a, sample_nav("A"));
+    }
+
+    // #18: Replace orchestration (run_replace_all), no egui/GrepApp context
+    fn replace_regex(pattern: &str) -> Regex {
+        build_regex(&SearchParams {
+            pattern: pattern.to_string(),
+            ..SearchParams::default()
+        })
+        .unwrap()
+    }
+
+    fn fm_for(path: &Path) -> FileMatch {
+        FileMatch {
+            path: path.to_path_buf(),
+            matches: vec![],
+        }
+    }
+
+    #[test]
+    fn test_run_replace_all_backs_up_before_writing() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let file = src_dir.path().join("a.txt");
+        std::fs::write(&file, "foo123").unwrap();
+
+        let summary = run_replace_all(
+            &[fm_for(&file)],
+            &replace_regex("foo"),
+            "bar",
+            true,
+            backup_dir.path(),
+            "session1",
+        );
+
+        assert_eq!(
+            summary,
+            ReplaceSummary {
+                ok: 1,
+                err: 0,
+                replaced_instances: 1
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "bar123");
+
+        // The backup holds the *original* content, not the replaced one.
+        let canonical = file.canonicalize().unwrap();
+        let safe_rel: PathBuf = canonical
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let backup_path = backup_dir.path().join("session1").join(safe_rel);
+        assert_eq!(std::fs::read_to_string(backup_path).unwrap(), "foo123");
+    }
+
+    #[test]
+    fn test_run_replace_all_no_backup_when_disabled() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let file = src_dir.path().join("a.txt");
+        std::fs::write(&file, "foo123").unwrap();
+
+        let summary = run_replace_all(
+            &[fm_for(&file)],
+            &replace_regex("foo"),
+            "bar",
+            false,
+            backup_dir.path(),
+            "session1",
+        );
+
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.err, 0);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "bar123");
+        // Nothing should have been written under the backup root.
+        assert!(!backup_dir.path().join("session1").exists());
+    }
+
+    #[test]
+    fn test_run_replace_all_skips_file_on_backup_failure() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
+        // Points at a file that was never created, so backup_file_to's
+        // fs::copy (source doesn't exist) fails deterministically.
+        let missing = src_dir.path().join("missing.txt");
+
+        let summary = run_replace_all(
+            &[fm_for(&missing)],
+            &replace_regex("foo"),
+            "bar",
+            true,
+            backup_dir.path(),
+            "session1",
+        );
+
+        assert_eq!(
+            summary,
+            ReplaceSummary {
+                ok: 0,
+                err: 1,
+                replaced_instances: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_run_replace_all_counts_error_when_replace_fails_no_backup() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
+        // With backup disabled, apply_replace's own file read is what fails.
+        let missing = src_dir.path().join("missing.txt");
+
+        let summary = run_replace_all(
+            &[fm_for(&missing)],
+            &replace_regex("foo"),
+            "bar",
+            false,
+            backup_dir.path(),
+            "session1",
+        );
+
+        assert_eq!(
+            summary,
+            ReplaceSummary {
+                ok: 0,
+                err: 1,
+                replaced_instances: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_run_replace_all_accurate_count_across_multiple_files() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let file1 = src_dir.path().join("a.txt");
+        let file2 = src_dir.path().join("b.txt");
+        std::fs::write(&file1, "foo foo").unwrap(); // 2 matches
+        std::fs::write(&file2, "foo").unwrap(); // 1 match
+
+        let summary = run_replace_all(
+            &[fm_for(&file1), fm_for(&file2)],
+            &replace_regex("foo"),
+            "bar",
+            false,
+            backup_dir.path(),
+            "session1",
+        );
+
+        assert_eq!(summary.ok, 2);
+        assert_eq!(summary.err, 0);
+        assert_eq!(summary.replaced_instances, 3);
+        assert_eq!(std::fs::read_to_string(&file1).unwrap(), "bar bar");
+        assert_eq!(std::fs::read_to_string(&file2).unwrap(), "bar");
+    }
 
     // #24: history recording mode
     #[test]

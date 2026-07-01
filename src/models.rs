@@ -108,8 +108,9 @@ impl From<&SearchResult> for HistoryEntry {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub enum ViewMode {
+    #[default]
     Tree,
     Flat,
 }
