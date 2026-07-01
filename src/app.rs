@@ -349,8 +349,10 @@ impl GrepApp {
         let history = History::load(config.history_limit);
         let next_history_id = history.next_id();
 
+        let params = SearchParams::seeded_from_config(&config);
+
         Self {
-            params: SearchParams::default(),
+            params,
             config,
             history,
             next_history_id,
@@ -509,6 +511,7 @@ impl GrepApp {
         self.active_tab = Some(self.tabs.len() - 1);
         self.current_result = None;
         self.apply_nav_state(TabNavState::default());
+        self.params.apply_default_search_options(&self.config);
     }
 
     fn update_active_tab(&mut self, result: SearchResult) {
@@ -5285,6 +5288,37 @@ impl GrepApp {
                 });
                 settings_row(ui, pal, "History limit", |ui| {
                     ui.add(egui::Slider::new(&mut self.config.history_limit, 1..=1000));
+                });
+
+                settings_group_header(ui, pal, "Defaults");
+                settings_row(ui, pal, "Context lines", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.default_context_lines)
+                            .range(0..=10)
+                            .speed(0.1),
+                    );
+                });
+                settings_row(ui, pal, "Max depth", |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.default_max_depth)
+                            .range(0..=100)
+                            .speed(0.1)
+                            .custom_formatter(|val, _| {
+                                if val == 0.0 {
+                                    "Unlimited".to_string()
+                                } else {
+                                    format!("{:.0}", val)
+                                }
+                            }),
+                    );
+                });
+                settings_row(ui, pal, "New search options", |ui| {
+                    ui.checkbox(&mut self.config.default_is_regex, "Regex")
+                        .on_hover_text("Regular expression mode");
+                    ui.checkbox(&mut self.config.default_case_sensitive, "Case")
+                        .on_hover_text("Case sensitive");
+                    ui.checkbox(&mut self.config.default_word_boundary, "Word")
+                        .on_hover_text("Whole word only (\\b...\\b)");
                 });
             }
             2 => {

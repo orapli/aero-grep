@@ -112,6 +112,14 @@ fn default_preset_enabled() -> bool {
     true
 }
 
+fn default_default_context_lines() -> usize {
+    0
+}
+
+fn default_default_max_depth() -> usize {
+    0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Preset {
     pub name: String,
@@ -280,6 +288,20 @@ pub struct Config {
     pub search_hidden: bool,
     #[serde(default)]
     pub history_mode: HistoryMode,
+    /// Seeds new searches' Context lines (#30). Existing per-search edits
+    /// are never overwritten by this — only fresh `SearchParams`.
+    #[serde(default = "default_default_context_lines")]
+    pub default_context_lines: usize,
+    /// Seeds new searches' Max depth; 0 = unlimited, matching the
+    /// `SearchParams::max_depth == None` convention used by grep.rs (#30).
+    #[serde(default = "default_default_max_depth")]
+    pub default_max_depth: usize,
+    #[serde(default)]
+    pub default_case_sensitive: bool,
+    #[serde(default)]
+    pub default_is_regex: bool,
+    #[serde(default)]
+    pub default_word_boundary: bool,
 }
 
 impl Default for Config {
@@ -313,6 +335,11 @@ impl Default for Config {
             follow_symlinks: false,
             search_hidden: true,
             history_mode: HistoryMode::default(),
+            default_context_lines: default_default_context_lines(),
+            default_max_depth: default_default_max_depth(),
+            default_case_sensitive: false,
+            default_is_regex: false,
+            default_word_boundary: false,
         }
     }
 }
@@ -325,6 +352,9 @@ impl Config {
     fn clamp_values(&mut self) {
         self.font_size = self.font_size.clamp(10.0, 24.0);
         self.history_limit = self.history_limit.clamp(1, 1000);
+        // Matches the advanced-row DragValue ranges in app.rs (#30).
+        self.default_context_lines = self.default_context_lines.clamp(0, 10);
+        self.default_max_depth = self.default_max_depth.clamp(0, 100);
     }
 
     /// Resets to defaults while keeping user-created presets (#29).
@@ -394,6 +424,20 @@ mod tests {
             restored.export_omit_single_file_name
         );
         assert_eq!(original.history_mode, restored.history_mode);
+        assert_eq!(
+            original.default_context_lines,
+            restored.default_context_lines
+        );
+        assert_eq!(original.default_max_depth, restored.default_max_depth);
+        assert_eq!(
+            original.default_case_sensitive,
+            restored.default_case_sensitive
+        );
+        assert_eq!(original.default_is_regex, restored.default_is_regex);
+        assert_eq!(
+            original.default_word_boundary,
+            restored.default_word_boundary
+        );
     }
 
     #[test]
@@ -416,6 +460,34 @@ mod tests {
         assert!(!cfg.export_header_enabled);
         assert!(!cfg.export_omit_single_file_name);
         assert_eq!(cfg.history_mode, HistoryMode::Auto);
+        assert_eq!(cfg.default_context_lines, 0);
+        assert_eq!(cfg.default_max_depth, 0);
+        assert!(!cfg.default_case_sensitive);
+        assert!(!cfg.default_is_regex);
+        assert!(!cfg.default_word_boundary);
+    }
+
+    // #30: persisted default search options
+    #[test]
+    fn test_default_search_options_default_to_zero_false() {
+        let cfg = Config::default();
+        assert_eq!(cfg.default_context_lines, 0);
+        assert_eq!(cfg.default_max_depth, 0);
+        assert!(!cfg.default_case_sensitive);
+        assert!(!cfg.default_is_regex);
+        assert!(!cfg.default_word_boundary);
+    }
+
+    #[test]
+    fn test_default_search_options_clamped() {
+        let mut cfg = Config {
+            default_context_lines: 999,
+            default_max_depth: 999,
+            ..Config::default()
+        };
+        cfg.clamp_values();
+        assert_eq!(cfg.default_context_lines, 10);
+        assert_eq!(cfg.default_max_depth, 100);
     }
 
     // #24: history recording mode

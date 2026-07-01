@@ -32,6 +32,30 @@ pub struct SearchParams {
     pub roots: Vec<String>,
 }
 
+impl SearchParams {
+    /// Builds fresh params seeded from the user's persisted defaults (#30):
+    /// Context lines / Max depth / Case / Regex / Word. Only for genuinely
+    /// new searches (app startup, new tab) — never call this on params
+    /// belonging to an in-progress or already-run search.
+    pub fn seeded_from_config(config: &crate::config::Config) -> Self {
+        let mut params = Self::default();
+        params.apply_default_search_options(config);
+        params
+    }
+
+    /// Overwrites just the persisted-default fields (Context lines / Max
+    /// depth / Case / Regex / Word), leaving pattern/directory/glob/etc.
+    /// untouched. Used when opening a new tab (#30) — the search inputs
+    /// carry over by design, only the advanced-row defaults reset.
+    pub fn apply_default_search_options(&mut self, config: &crate::config::Config) {
+        self.context_lines = config.default_context_lines;
+        self.max_depth = (config.default_max_depth != 0).then_some(config.default_max_depth);
+        self.case_sensitive = config.default_case_sensitive;
+        self.is_regex = config.default_is_regex;
+        self.word_boundary = config.default_word_boundary;
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MatchRange {
     pub start: usize,
