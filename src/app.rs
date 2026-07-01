@@ -1,4 +1,4 @@
-use crate::config::{Config, HistoryMode, Theme};
+use crate::config::{Config, EditorPreset, HistoryMode, Theme};
 use crate::grep::{apply_replace, build_regex, count_total_matches, search};
 use crate::history::History;
 use crate::models::{
@@ -1027,7 +1027,7 @@ impl GrepApp {
                     None
                 }
             });
-            open_in_editor(path, line, &editor_cmd);
+            open_in_editor(path, line, &editor_cmd, self.config.editor_preset);
         }
     }
 
@@ -3737,6 +3737,7 @@ impl GrepApp {
 
         // ── File list ──────────────────────────────────────────────────
         let editor_cmd = self.config.editor_command.clone();
+        let editor_preset = self.config.editor_preset;
 
         match self.view_mode {
             ViewMode::Flat => {
@@ -3785,7 +3786,7 @@ impl GrepApp {
                     },
                 );
                 if let Some(p) = open_req {
-                    open_in_editor(&p, None, &editor_cmd);
+                    open_in_editor(&p, None, &editor_cmd, editor_preset);
                 }
             }
             ViewMode::Tree => {
@@ -3943,7 +3944,7 @@ impl GrepApp {
                         ui.add_space(8.0);
                     });
                 if let Some(p) = open_req {
-                    open_in_editor(&p, None, &editor_cmd);
+                    open_in_editor(&p, None, &editor_cmd, editor_preset);
                 }
             }
         }
@@ -4338,6 +4339,7 @@ impl GrepApp {
 
         let dir = result.params.directory.clone();
         let editor_cmd = self.config.editor_command.clone();
+        let editor_preset = self.config.editor_preset;
 
         // horizontalの無限幅判定を回避するため、ScrollAreaの外で可視幅を取得
         let available_w = ui.available_width();
@@ -4558,7 +4560,7 @@ impl GrepApp {
                             .sense(egui::Sense::click()),
                         );
                         if path_resp.double_clicked() && !editor_cmd.is_empty() {
-                            open_in_editor(&fm.path, None, &editor_cmd);
+                            open_in_editor(&fm.path, None, &editor_cmd, editor_preset);
                         }
                         if display_rel != *rel {
                             path_resp.on_hover_text(rel);
@@ -4676,7 +4678,12 @@ impl GrepApp {
                                     ));
                                 }
                                 if !editor_cmd.is_empty() {
-                                    open_in_editor(&fm.path, Some(lm.line_number), &editor_cmd);
+                                    open_in_editor(
+                                        &fm.path,
+                                        Some(lm.line_number),
+                                        &editor_cmd,
+                                        editor_preset,
+                                    );
                                 }
                             }
                             if gutter.hovered() && lm.is_match {
@@ -5387,25 +5394,57 @@ impl GrepApp {
             3 => {
                 // ── Editor ────────────────────────────────────────────
                 settings_row(ui, pal, "Command", |ui| {
+                    let hint = match self.config.editor_preset {
+                        EditorPreset::Custom => "zed  /  code -g  /  {file}:{line}",
+                        EditorPreset::VsCode | EditorPreset::JetBrains | EditorPreset::Sublime => {
+                            "program name or path only"
+                        }
+                    };
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.editor_command)
-                            .hint_text(
-                                RichText::new("zed  /  code -g  /  nvim")
-                                    .color(pal.placeholder)
-                                    .italics(),
-                            )
+                            .hint_text(RichText::new(hint).color(pal.placeholder).italics())
                             .desired_width(f32::INFINITY),
                     );
                 });
+                if self.config.editor_preset != EditorPreset::Custom {
+                    settings_row(ui, pal, "", |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} preset: line/column flags are added automatically.",
+                                self.config.editor_preset.label()
+                            ))
+                            .color(pal.muted)
+                            .size(10.5),
+                        );
+                    });
+                }
                 settings_row(ui, pal, "Presets", |ui| {
-                    for (label, cmd) in [
-                        ("Zed", "zed"),
-                        ("VS Code", "code -g"),
-                        ("Neovim", "nvim"),
-                        ("Vim", "vim"),
+                    for (label, fallback_cmd, preset) in [
+                        ("Zed", "zed", EditorPreset::Custom),
+                        ("VS Code", "", EditorPreset::VsCode),
+                        ("JetBrains", "", EditorPreset::JetBrains),
+                        ("Sublime", "", EditorPreset::Sublime),
+                        ("Neovim", "nvim", EditorPreset::Custom),
+                        ("Vim", "vim", EditorPreset::Custom),
                     ] {
-                        if ui.small_button(RichText::new(label).size(11.0)).clicked() {
+                        // Custom presets (Zed/Neovim/Vim) have no canonical
+                        // binary in EditorPreset, so fall back to the
+                        // literal command for those.
+                        let cmd = preset.default_binary().unwrap_or(fallback_cmd);
+                        let detected = is_on_path(cmd);
+                        let color = if detected { pal.text } else { pal.muted };
+                        let hover = if detected {
+                            "Detected on PATH"
+                        } else {
+                            "Not detected on PATH — you can still select it"
+                        };
+                        if ui
+                            .small_button(RichText::new(label).color(color).size(11.0))
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
                             self.config.editor_command = cmd.to_string();
+                            self.config.editor_preset = preset;
                         }
                     }
                 });
@@ -5418,7 +5457,12 @@ impl GrepApp {
                             .clicked()
                         {
                             let self_path = std::path::Path::new(file!());
-                            open_in_editor(self_path, Some(1), &editor_cmd);
+                            open_in_editor(
+                                self_path,
+                                Some(1),
+                                &editor_cmd,
+                                self.config.editor_preset,
+                            );
                         }
                     });
                     ui.label(
@@ -7797,21 +7841,72 @@ fn toolbar_frame(pal: Pal) -> egui::Frame {
     })
 }
 
-fn open_in_editor(path: &Path, line: Option<usize>, editor_cmd: &str) {
-    if editor_cmd.trim().is_empty() {
+/// Pure: builds the argv (program followed by args) to launch `editor_cmd`
+/// at `path`[:`line`] per `preset`'s CLI convention (#20). `None` if
+/// `editor_cmd` is empty/whitespace. No I/O, so this is unit-testable
+/// without touching the filesystem or spawning a process.
+///
+/// `Custom` preserves the exact pre-#20 behavior for commands with no
+/// placeholders (whitespace-split program+args, `path:line` appended) so
+/// existing `editor_command` values (e.g. "zed", "code -g") keep working
+/// unchanged. If the command contains `{file}`/`{line}`/`{col}`, those are
+/// substituted instead (`{col}` is always empty today — no caller supplies
+/// a column yet).
+fn build_editor_invocation(
+    preset: EditorPreset,
+    editor_cmd: &str,
+    path: &Path,
+    line: Option<usize>,
+) -> Option<Vec<String>> {
+    let editor_cmd = editor_cmd.trim();
+    if editor_cmd.is_empty() {
+        return None;
+    }
+    let file = path.display().to_string();
+    let file_line = match line {
+        Some(ln) => format!("{file}:{ln}"),
+        None => file.clone(),
+    };
+    Some(match preset {
+        EditorPreset::VsCode => vec![editor_cmd.to_string(), "-g".to_string(), file_line],
+        EditorPreset::Sublime => vec![editor_cmd.to_string(), file_line],
+        EditorPreset::JetBrains => match line {
+            Some(ln) => vec![
+                editor_cmd.to_string(),
+                "--line".to_string(),
+                ln.to_string(),
+                file,
+            ],
+            None => vec![editor_cmd.to_string(), file],
+        },
+        EditorPreset::Custom => {
+            let has_placeholders = ["{file}", "{line}", "{col}"]
+                .iter()
+                .any(|ph| editor_cmd.contains(ph));
+            if has_placeholders {
+                let line_str = line.map(|ln| ln.to_string()).unwrap_or_default();
+                let substituted = editor_cmd
+                    .replace("{file}", &file)
+                    .replace("{line}", &line_str)
+                    .replace("{col}", "");
+                substituted.split_whitespace().map(str::to_string).collect()
+            } else {
+                let mut argv: Vec<String> =
+                    editor_cmd.split_whitespace().map(str::to_string).collect();
+                argv.push(file_line);
+                argv
+            }
+        }
+    })
+}
+
+fn open_in_editor(path: &Path, line: Option<usize>, editor_cmd: &str, preset: EditorPreset) {
+    let Some(mut argv) = build_editor_invocation(preset, editor_cmd, path, line) else {
         return;
-    }
-    let mut parts = editor_cmd.split_whitespace();
-    let Some(prog) = parts.next() else { return };
+    };
+    let prog = argv.remove(0);
     let mut cmd = std::process::Command::new(prog);
-    for arg in parts {
-        cmd.arg(arg);
-    }
-    if let Some(ln) = line {
-        cmd.arg(format!("{}:{}", path.display(), ln));
-    } else {
-        cmd.arg(path);
-    }
+    cmd.args(argv);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -7819,6 +7914,28 @@ fn open_in_editor(path: &Path, line: Option<usize>, editor_cmd: &str) {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let _ = cmd.spawn();
+}
+
+/// Best-effort check for whether `prog` resolves on `PATH` (#20 editor
+/// auto-detection). False negatives are fine — it's a UI hint, not a gate.
+fn is_on_path(prog: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        if dir.join(prog).is_file() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            for ext in ["exe", "cmd", "bat"] {
+                if dir.join(format!("{prog}.{ext}")).is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    })
 }
 
 /// Reveals `path` in the OS file manager (Finder / Explorer / whatever
@@ -7877,6 +7994,77 @@ fn format_ts(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #20: editor integration presets — build_editor_invocation is pure
+    // (no I/O), so the argv construction is fully unit-testable without
+    // spawning a process.
+    #[test]
+    fn test_build_editor_invocation_empty_command_returns_none() {
+        assert_eq!(
+            build_editor_invocation(EditorPreset::Custom, "  ", Path::new("a.rs"), Some(3)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_build_editor_invocation_custom_legacy_no_placeholders() {
+        // Matches the pre-#20 behavior exactly: split_whitespace + append path:line.
+        let argv =
+            build_editor_invocation(EditorPreset::Custom, "code -g", Path::new("a.rs"), Some(3))
+                .unwrap();
+        assert_eq!(argv, vec!["code", "-g", "a.rs:3"]);
+    }
+
+    #[test]
+    fn test_build_editor_invocation_custom_legacy_no_line() {
+        let argv =
+            build_editor_invocation(EditorPreset::Custom, "zed", Path::new("a.rs"), None).unwrap();
+        assert_eq!(argv, vec!["zed", "a.rs"]);
+    }
+
+    #[test]
+    fn test_build_editor_invocation_custom_placeholders() {
+        let argv = build_editor_invocation(
+            EditorPreset::Custom,
+            "myeditor --goto {file}:{line}",
+            Path::new("a.rs"),
+            Some(7),
+        )
+        .unwrap();
+        assert_eq!(argv, vec!["myeditor", "--goto", "a.rs:7"]);
+    }
+
+    #[test]
+    fn test_build_editor_invocation_vscode_adds_g_flag() {
+        let argv =
+            build_editor_invocation(EditorPreset::VsCode, "code", Path::new("a.rs"), Some(5))
+                .unwrap();
+        assert_eq!(argv, vec!["code", "-g", "a.rs:5"]);
+    }
+
+    #[test]
+    fn test_build_editor_invocation_jetbrains_uses_line_flag() {
+        let argv =
+            build_editor_invocation(EditorPreset::JetBrains, "idea", Path::new("a.rs"), Some(5))
+                .unwrap();
+        assert_eq!(argv, vec!["idea", "--line", "5", "a.rs"]);
+    }
+
+    #[test]
+    fn test_build_editor_invocation_jetbrains_no_line_omits_flag() {
+        let argv =
+            build_editor_invocation(EditorPreset::JetBrains, "idea", Path::new("a.rs"), None)
+                .unwrap();
+        assert_eq!(argv, vec!["idea", "a.rs"]);
+    }
+
+    #[test]
+    fn test_build_editor_invocation_sublime_file_colon_line() {
+        let argv =
+            build_editor_invocation(EditorPreset::Sublime, "subl", Path::new("a.rs"), Some(9))
+                .unwrap();
+        assert_eq!(argv, vec!["subl", "a.rs:9"]);
+    }
 
     // #18: tab-navigation-state mirroring (save_tab_nav / load_tab_nav),
     // tested directly against ResultTab/TabNavState with no GrepApp/eframe

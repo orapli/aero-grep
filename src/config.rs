@@ -22,6 +22,43 @@ impl Theme {
     }
 }
 
+/// Editor invocation convention used by `build_editor_invocation` (#20).
+/// `Custom` preserves the legacy free-form `editor_command` behavior
+/// (whitespace-split program+args, `{file}`/`{line}`/`{col}` placeholders
+/// if present, else `path:line` appended) so old configs keep working
+/// unchanged; the others bake in each editor's known CLI flags.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub enum EditorPreset {
+    #[default]
+    Custom,
+    VsCode,
+    JetBrains,
+    Sublime,
+}
+
+impl EditorPreset {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Custom => "Custom",
+            Self::VsCode => "VS Code",
+            Self::JetBrains => "JetBrains",
+            Self::Sublime => "Sublime Text",
+        }
+    }
+
+    /// The program name to auto-detect on PATH and prefill into
+    /// `editor_command` when this preset is selected. `None` for `Custom`,
+    /// which has no canonical binary.
+    pub fn default_binary(&self) -> Option<&'static str> {
+        match self {
+            Self::Custom => None,
+            Self::VsCode => Some("code"),
+            Self::JetBrains => Some("idea"),
+            Self::Sublime => Some("subl"),
+        }
+    }
+}
+
 /// Controls whether/how completed searches are recorded into History (#24).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Copy, Default)]
 pub enum HistoryMode {
@@ -237,6 +274,8 @@ pub struct Config {
     #[serde(default)]
     pub editor_command: String,
     #[serde(default)]
+    pub editor_preset: EditorPreset,
+    #[serde(default)]
     pub theme: Theme,
     #[serde(default = "default_font_size")]
     pub font_size: f32,
@@ -310,6 +349,7 @@ impl Default for Config {
             history_limit: 100,
             max_file_size_mb: 50,
             editor_command: String::new(),
+            editor_preset: EditorPreset::default(),
             theme: Theme::default(),
             font_size: 13.0,
             backup_before_replace: true,
@@ -438,6 +478,7 @@ mod tests {
             original.default_word_boundary,
             restored.default_word_boundary
         );
+        assert_eq!(original.editor_preset, restored.editor_preset);
     }
 
     #[test]
@@ -465,6 +506,28 @@ mod tests {
         assert!(!cfg.default_case_sensitive);
         assert!(!cfg.default_is_regex);
         assert!(!cfg.default_word_boundary);
+        assert_eq!(cfg.editor_preset, EditorPreset::Custom);
+    }
+
+    // #20: editor integration presets
+    #[test]
+    fn test_editor_preset_defaults_to_custom() {
+        assert_eq!(EditorPreset::default(), EditorPreset::Custom);
+        assert_eq!(Config::default().editor_preset, EditorPreset::Custom);
+    }
+
+    #[test]
+    fn test_editor_preset_serde_roundtrip() {
+        for preset in [
+            EditorPreset::Custom,
+            EditorPreset::VsCode,
+            EditorPreset::JetBrains,
+            EditorPreset::Sublime,
+        ] {
+            let json = serde_json::to_string(&preset).unwrap();
+            let restored: EditorPreset = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, preset);
+        }
     }
 
     // #30: persisted default search options
