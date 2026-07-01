@@ -779,13 +779,17 @@ impl GrepApp {
         if should_auto_record(self.config.history_mode) {
             self.record_to_history(&result);
         }
-        self.current_match = if !result.files.is_empty() && !result.files[0].matches.is_empty() {
-            let idx = result.files[0]
-                .matches
-                .iter()
-                .position(|m| m.is_match)
-                .unwrap_or(0);
-            Some((0, idx))
+        // `current_match`'s second element is the index among *only* the
+        // is_match lines (the "filtered" convention — see #27), matching
+        // how show_content_panel and the gutter-click writer read/write it.
+        // The first match is therefore always filtered index 0 regardless
+        // of how many context lines (is_match == false) precede it.
+        self.current_match = if result
+            .files
+            .first()
+            .is_some_and(|fm| fm.matches.iter().any(|m| m.is_match))
+        {
+            Some((0, 0))
         } else {
             None
         };
@@ -963,12 +967,9 @@ impl GrepApp {
                 .iter()
                 .position(|f| f.path == paths[next_idx])
                 .unwrap_or(0);
-            let first_match_idx = result.files[actual_f_idx]
-                .matches
-                .iter()
-                .position(|m| m.is_match)
-                .unwrap_or(0);
-            self.current_match = Some((actual_f_idx, first_match_idx));
+            // Filtered-index convention (see #27): the first match in the
+            // file is always filtered index 0.
+            self.current_match = Some((actual_f_idx, 0));
             self.scroll_to_current = true;
         }
     }
@@ -1001,12 +1002,9 @@ impl GrepApp {
                 .iter()
                 .position(|f| f.path == paths[prev_idx])
                 .unwrap_or(0);
-            let first_match_idx = result.files[actual_f_idx]
-                .matches
-                .iter()
-                .position(|m| m.is_match)
-                .unwrap_or(0);
-            self.current_match = Some((actual_f_idx, first_match_idx));
+            // Filtered-index convention (see #27): the first match in the
+            // file is always filtered index 0.
+            self.current_match = Some((actual_f_idx, 0));
             self.scroll_to_current = true;
         }
     }
@@ -1053,13 +1051,14 @@ impl GrepApp {
         for f in &result.files {
             self.selected_files.insert(f.path.clone());
         }
-        self.current_match = if !result.files.is_empty() && !result.files[0].matches.is_empty() {
-            let idx = result.files[0]
-                .matches
-                .iter()
-                .position(|m| m.is_match)
-                .unwrap_or(0);
-            Some((0, idx))
+        // Filtered-index convention (see #27): the first match is always
+        // filtered index 0, regardless of preceding context lines.
+        self.current_match = if result
+            .files
+            .first()
+            .is_some_and(|fm| fm.matches.iter().any(|m| m.is_match))
+        {
+            Some((0, 0))
         } else {
             None
         };
@@ -7147,13 +7146,27 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 /// otherwise F3 could land `current_match` on a line hidden by the filter,
 /// where nothing visibly happens. An empty filter matches everything, same
 /// as before the filter existed.
+///
+/// `match_idx` uses the *filtered* convention (#27): the running count of
+/// `is_match` lines seen so far in the file, ignoring any interleaved
+/// context lines (`is_match == false`, present when `context_lines > 0`).
+/// This matches how `show_content_panel`'s `current_active_line` and the
+/// gutter-click writer read/write `current_match`
+/// (`fm.matches.iter().filter(|m| m.is_match).nth(match_idx)`) — using the
+/// raw `fm.matches` enumerate index instead would drift from that lookup
+/// whenever context lines are present.
 fn match_navigation_candidates(result: &SearchResult, content_filter: &str) -> Vec<(usize, usize)> {
     let mut candidates = Vec::new();
     for (f_idx, fm) in result.files.iter().enumerate() {
-        for (m_idx, lm) in fm.matches.iter().enumerate() {
-            if lm.is_match && contains_ignore_ascii_case(&lm.content, content_filter) {
-                candidates.push((f_idx, m_idx));
+        let mut filtered_idx = 0usize;
+        for lm in &fm.matches {
+            if !lm.is_match {
+                continue;
             }
+            if contains_ignore_ascii_case(&lm.content, content_filter) {
+                candidates.push((f_idx, filtered_idx));
+            }
+            filtered_idx += 1;
         }
     }
     candidates
@@ -7712,6 +7725,43 @@ mod tests {
         let result = sample_result();
         let candidates = match_navigation_candidates(&result, "nope");
         assert!(candidates.is_empty());
+    }
+
+    // #27: current_match must use the *filtered* (is_match-only) index
+    // convention, matching show_content_panel's read side, even when
+    // context lines (is_match == false) are interleaved (context_lines > 0).
+    #[test]
+    fn test_match_navigation_candidates_uses_filtered_index_with_context_lines() {
+        let result = SearchResult {
+            id: 1,
+            params: SearchParams::default(),
+            files: vec![FileMatch {
+                path: PathBuf::from("a.rs"),
+                matches: vec![
+                    make_line(1, "before", false), // context, raw idx 0
+                    make_line(2, "foo bar", true), // match, raw idx 1, filtered idx 0
+                    make_line(3, "after", false),  // context, raw idx 2
+                    make_line(4, "after2", false), // context, raw idx 3
+                    make_line(5, "foo baz", true), // match, raw idx 4, filtered idx 1
+                ],
+            }],
+            timestamp: "2026-01-01T00:00:00".to_string(),
+            duration_ms: 0,
+            total_matches: 2,
+            truncated: false,
+        };
+        let candidates = match_navigation_candidates(&result, "");
+        // Filtered indices (0, 1), NOT the raw enumerate indices (1, 4) that
+        // a naive `fm.matches.iter().enumerate()` would have produced.
+        assert_eq!(candidates, vec![(0, 0), (0, 1)]);
+
+        // The read-side lookup (mirroring show_content_panel's
+        // current_active_line) must land on the correct line for each.
+        let fm = &result.files[0];
+        for (expected_line, (_, m_idx)) in [(2, candidates[0]), (5, candidates[1])] {
+            let lm = fm.matches.iter().filter(|m| m.is_match).nth(m_idx).unwrap();
+            assert_eq!(lm.line_number, expected_line);
+        }
     }
 
     // #16: content panel virtualization windowing
