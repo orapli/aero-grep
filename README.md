@@ -2,6 +2,15 @@
 
 A fast, cross-project full-text search GUI built with Rust and [egui](https://github.com/emilk/egui).
 
+**Speed, honestly:** aero-grep is built on the same libraries as `rg`
+(ripgrep) and runs the search in-process rather than shelling out to a
+`rg` subprocess. Measured against `rg` 15.1.0, aero-grep is **1.5–2.4×
+faster on project-sized searches** (a handful to a few thousand files —
+the common case for an interactive tool); the two are roughly even at
+medium scale (~2,000 files), and `rg`'s engine pulls ahead by ~1.1–1.6× on
+very large single-query corpora (tens of thousands of files, 780+ MB).
+Full methodology and numbers: [BENCH.md](BENCH.md).
+
 ## Features
 
 - **ripgrep-powered search** — uses the same libraries as ripgrep for speed, `.gitignore` support, encoding detection, binary-file skipping, and whole-word matching
@@ -88,5 +97,10 @@ A CLI benchmark binary is included to compare search performance against `rg`:
 cargo build --bin bench --release
 ./target/release/bench /path/to/project "pattern"
 ```
+
+See [BENCH.md](BENCH.md) for methodology, gotchas (case-sensitivity
+defaults differ between the two tools; `--no-limit` disables aero-grep's
+result cap for large corpora), and measured results across small/medium/
+large corpora.
 
 See `BENCH.md` for details.

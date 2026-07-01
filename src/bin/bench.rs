@@ -1,9 +1,14 @@
 /// Minimal benchmark binary: measures grep.rs::search() against `rg`.
 ///
-/// Usage: cargo run --bin bench --release -- <dir> <pattern> [--regex] [--case] [--word]
+/// Usage: cargo run --bin bench --release -- <dir> <pattern> [--regex] [--case] [--word] [--no-limit]
 ///
 /// Reports elapsed time, file count, and match counts so you can compare with:
 ///   time rg [opts] '<pattern>' '<dir>'
+///
+/// `--no-limit` disables `max_result_files` (default config caps at 2000).
+/// Use it when comparing against `rg` (which has no such cap) on corpora
+/// with more than 2000 matching files — otherwise aero-grep silently
+/// searches fewer files than rg and the timings aren't comparable.
 #[path = "../config.rs"]
 pub mod config;
 #[path = "../grep.rs"]
@@ -24,7 +29,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage: {} <directory> <pattern> [--regex] [--case] [--word]",
+            "Usage: {} <directory> <pattern> [--regex] [--case] [--word] [--no-limit]",
             args[0]
         );
         std::process::exit(1);
@@ -34,11 +39,17 @@ fn main() {
     let is_regex = args.iter().any(|a| a == "--regex");
     let case_sensitive = args.iter().any(|a| a == "--case");
     let word_boundary = args.iter().any(|a| a == "--word");
+    let no_limit = args.iter().any(|a| a == "--no-limit");
 
     let config = Config {
         max_threads: std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4),
+        max_result_files: if no_limit {
+            0
+        } else {
+            Config::default().max_result_files
+        },
         ..Config::default()
     };
 
