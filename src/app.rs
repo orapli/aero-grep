@@ -8372,12 +8372,26 @@ fn build_editor_invocation(
                 .iter()
                 .any(|ph| editor_cmd.contains(ph));
             if has_placeholders {
+                // Tokenize *before* substituting (#32): substituting into the
+                // whole string first and then split_whitespace()-ing the
+                // result would break a {file} path containing spaces into
+                // multiple argv elements. Per-token substitution keeps
+                // {file}/{file}:{line} as a single element regardless.
                 let line_str = line.map(|ln| ln.to_string()).unwrap_or_default();
-                let substituted = editor_cmd
-                    .replace("{file}", &file)
-                    .replace("{line}", &line_str)
-                    .replace("{col}", "");
-                substituted.split_whitespace().map(str::to_string).collect()
+                editor_cmd
+                    .split_whitespace()
+                    .map(|tok| {
+                        tok.replace("{file}", &file)
+                            .replace("{line}", &line_str)
+                            .replace("{col}", "")
+                    })
+                    // A token that's *only* an empty-substituting placeholder
+                    // (e.g. standalone "{col}", or "{line}" with no line
+                    // number) would otherwise leave an empty argv element —
+                    // split_whitespace() elided these under the old
+                    // replace-then-split order, so preserve that here.
+                    .filter(|s| !s.is_empty())
+                    .collect()
             } else {
                 let mut argv: Vec<String> =
                     editor_cmd.split_whitespace().map(str::to_string).collect();
@@ -8551,6 +8565,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(argv, vec!["myeditor", "--goto", "a.rs:7"]);
+    }
+
+    // #32: a {file} substitution containing spaces must stay a single argv
+    // element (per-token substitution), not get split by split_whitespace().
+    #[test]
+    fn test_build_editor_invocation_custom_placeholders_path_with_spaces() {
+        let argv = build_editor_invocation(
+            EditorPreset::Custom,
+            "myeditor {file}:{line}",
+            Path::new("/a b/c.rs"),
+            Some(12),
+        )
+        .unwrap();
+        assert_eq!(argv, vec!["myeditor", "/a b/c.rs:12"]);
+    }
+
+    // #32 follow-up (Opus review): a standalone placeholder token that
+    // substitutes to an empty string (here {col}, always empty today) must
+    // not leave an empty argv element — matches the pre-#32 replace-then-
+    // split behavior, which elided these via split_whitespace().
+    #[test]
+    fn test_build_editor_invocation_custom_placeholders_elides_empty_tokens() {
+        let argv = build_editor_invocation(
+            EditorPreset::Custom,
+            "ed {file} {col}",
+            Path::new("/path"),
+            Some(5),
+        )
+        .unwrap();
+        assert_eq!(argv, vec!["ed", "/path"]);
     }
 
     #[test]
