@@ -269,6 +269,13 @@ pub struct GrepApp {
     /// Brief highlight on the "Save to history" button (#24, Manual mode)
     /// after a successful manual save, mirroring `copied_flash`'s pattern.
     history_saved_flash: Option<std::time::Instant>,
+    /// Id of the last result saved via the Manual "Save to history" button
+    /// (#26). Debounces repeat clicks on the same result — the button stays
+    /// disabled while `current_result.id` equals this, and re-enables once
+    /// a new search produces a different (monotonically higher, see #24)
+    /// id. Global rather than per-tab: ids never repeat within a session,
+    /// so this remains correct even after switching tabs.
+    last_saved_history_id: Option<u64>,
     focus_pattern: bool,
     focus_dir: bool,
     pat_suppress_popup_open: bool,
@@ -353,6 +360,7 @@ impl GrepApp {
             copied_flash: None,
             copied_file_flash: None,
             history_saved_flash: None,
+            last_saved_history_id: None,
             focus_pattern: false,
             focus_dir: false,
             pat_suppress_popup_open: false,
@@ -4188,16 +4196,28 @@ impl GrepApp {
                         // Manual recording mode (#24): auto-recording is off,
                         // so offer an explicit action to save the current
                         // search into history (summary + #25 snapshot).
+                        // Debounced (#26): disabled once this exact result
+                        // has already been saved, so repeat clicks can't
+                        // push duplicate history entries.
                         if self.config.history_mode == HistoryMode::Manual {
+                            let can_save =
+                                can_save_to_history(result.id, self.last_saved_history_id);
                             let just_saved = self
                                 .history_saved_flash
                                 .is_some_and(|t| t.elapsed().as_millis() < 1500);
-                            if ghost_icon_button(ui, pal, icons::STAR_FULL, just_saved)
-                                .on_hover_text("Save this search to history")
-                                .clicked()
-                            {
-                                save_to_history_req = true;
-                            }
+                            ui.add_enabled_ui(can_save, |ui| {
+                                let hover = if can_save {
+                                    "Save this search to history"
+                                } else {
+                                    "Already saved to history"
+                                };
+                                if ghost_icon_button(ui, pal, icons::STAR_FULL, just_saved)
+                                    .on_hover_text(hover)
+                                    .clicked()
+                                {
+                                    save_to_history_req = true;
+                                }
+                            });
                         }
                     });
                 });
@@ -4234,6 +4254,7 @@ impl GrepApp {
         }
         if let Some(result) = history_snapshot {
             self.record_to_history(&result);
+            self.last_saved_history_id = Some(result.id);
             self.history_saved_flash = Some(std::time::Instant::now());
             self.status_msg = "Saved to history".to_string();
         }
@@ -7180,6 +7201,14 @@ fn should_auto_record(mode: HistoryMode) -> bool {
     mode == HistoryMode::Auto
 }
 
+/// Whether the Manual "Save to history" button should be enabled for
+/// `current_id` (#26). Debounces repeat clicks on the same result: once
+/// `current_id` has been saved, disable Save until a new search produces a
+/// different id.
+fn can_save_to_history(current_id: u64, last_saved_id: Option<u64>) -> bool {
+    last_saved_id != Some(current_id)
+}
+
 // ── Content panel virtualization ────────────────────────────────────────────
 /// Given cumulative row-top offsets (`prefix[i]` = top of item `i`,
 /// `prefix.len() == item_count + 1`, last entry = total content height) and a
@@ -7645,6 +7674,24 @@ mod tests {
         assert!(should_auto_record(HistoryMode::Auto));
         assert!(!should_auto_record(HistoryMode::Manual));
         assert!(!should_auto_record(HistoryMode::Off));
+    }
+
+    // #26: debounce Manual "Save to history"
+    #[test]
+    fn test_can_save_to_history_nothing_saved_yet() {
+        assert!(can_save_to_history(1, None));
+    }
+
+    #[test]
+    fn test_can_save_to_history_disabled_for_already_saved_result() {
+        assert!(!can_save_to_history(5, Some(5)));
+    }
+
+    #[test]
+    fn test_can_save_to_history_enabled_for_a_different_result() {
+        // A new search (higher, monotonic id per #24) re-enables Save even
+        // though something was saved before.
+        assert!(can_save_to_history(6, Some(5)));
     }
 
     // #17: content filter polish
