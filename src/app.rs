@@ -3844,6 +3844,38 @@ impl GrepApp {
                                     file_entries.iter().map(|(p, _)| p.clone()).collect();
                             }
                             ui.separator();
+                            if ui
+                                .add_sized(
+                                    [24.0, 24.0],
+                                    egui::Button::new(icon_rt(
+                                        icons::CHEVRON_RIGHT,
+                                        15.0,
+                                        pal.subtext,
+                                    ))
+                                    .frame(false),
+                                )
+                                .on_hover_text("Collapse all")
+                                .clicked()
+                            {
+                                for (path, _) in &file_entries {
+                                    self.collapsed_files.insert(path.clone());
+                                }
+                            }
+                            if ui
+                                .add_sized(
+                                    [24.0, 24.0],
+                                    egui::Button::new(icon_rt(
+                                        icons::CHEVRON_DOWN,
+                                        15.0,
+                                        pal.subtext,
+                                    ))
+                                    .frame(false),
+                                )
+                                .on_hover_text("Expand all")
+                                .clicked()
+                            {
+                                self.collapsed_files.clear();
+                            }
                         }
                         let flat_active = matches!(self.view_mode, ViewMode::Flat);
                         let flat_color = if flat_active { pal.accent } else { pal.subtext };
@@ -4326,6 +4358,8 @@ impl GrepApp {
 
         let mut copy_all_req = false;
         let mut save_to_history_req = false;
+        let mut collapse_all_req = false;
+        let mut expand_all_req = false;
 
         // ── Search params header ──────────────────────────────────────────────
         egui::Frame::NONE
@@ -4528,6 +4562,20 @@ impl GrepApp {
                                 }
                             });
                         }
+
+                        ui.separator();
+                        if ghost_icon_button(ui, pal, icons::CHEVRON_RIGHT, false)
+                            .on_hover_text("Collapse all")
+                            .clicked()
+                        {
+                            collapse_all_req = true;
+                        }
+                        if ghost_icon_button(ui, pal, icons::CHEVRON_DOWN, false)
+                            .on_hover_text("Expand all")
+                            .clicked()
+                        {
+                            expand_all_req = true;
+                        }
                     });
                 });
             });
@@ -4566,6 +4614,16 @@ impl GrepApp {
             self.last_saved_history_id = Some(result.id);
             self.history_saved_flash = Some(std::time::Instant::now());
             self.status_msg = "Saved to history".to_string();
+        }
+
+        if expand_all_req {
+            self.collapsed_files.clear();
+        }
+        if collapse_all_req {
+            if let Some(r) = &self.current_result {
+                let paths: Vec<PathBuf> = r.files.iter().map(|f| f.path.clone()).collect();
+                self.collapsed_files.extend(paths);
+            }
         }
 
         let Some(result) = &self.current_result else {
