@@ -92,6 +92,9 @@
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize' />
         <Property Id='ARPHELPLINK' Value='https://github.com/orapli/aero-grep' />
 
+        <Icon Id='AppIcon.ico' SourceFile='assets\app.ico' />
+        <Property Id='ARPPRODUCTICON' Value='AppIcon.ico' />
+
         <UI>
             <UIRef Id='WixUI_Minimal' />
         </UI>
