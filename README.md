@@ -79,3 +79,7 @@ Settings are stored in:
 - Linux: `~/.config/aero-grep/config.json`
 
 Configure your editor command, theme, font size, default excluded directories, and more from the Settings panel (⚙ icon, top-right).
+
+## Developer Guide
+
+Architecture notes, palette/theme conventions, and other decisions not obvious from the code are in [doc/design.md](doc/design.md).
