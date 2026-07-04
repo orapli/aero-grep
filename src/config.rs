@@ -457,7 +457,11 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, data)?;
+        let mut tmp_path = path.clone().into_os_string();
+        tmp_path.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp_path);
+        std::fs::write(&tmp_path, data)?;
+        std::fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 }
