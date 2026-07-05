@@ -135,4 +135,4 @@ and assert the results appear in the AccessKit tree. One smoke test, not a suite
   replace-preview slicing (BL-69 / BL-17 class).
 - Added `truncate_path` tests incl. multibyte no-panic.
 - TP-4 (CI / static gate): done, see above.
-- (80 tests total, all passing.)
+- All tests passing (`cargo test`).
