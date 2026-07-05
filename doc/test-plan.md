@@ -104,13 +104,11 @@ prefer exposing a synchronous `search_blocking` test seam over `sleep`.
 
 ---
 
-## TP-4: CI / static gate (low effort, high leverage)
+## TP-4: CI / static gate — done
 
-- Add a GitHub Actions workflow running `cargo fmt --check`,
-  `cargo clippy -- -D warnings`, `cargo test` on push/PR.
-- Do **not** gate on coverage. Coverage (`cargo llvm-cov`) optional, for
-  visibility only.
-- Fix any `clippy -D warnings` findings surfaced (likely a few in `app.rs`).
+`.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --all-targets
+-- -D warnings`, `cargo test`, and `cargo build --release` on every push/PR to
+`main`/`master`.
 
 ---
 
@@ -136,4 +134,5 @@ and assert the results appear in the AccessKit tree. One smoke test, not a suite
   `common_suffix_len` incl. a multibyte no-panic regression mirroring the
   replace-preview slicing (BL-69 / BL-17 class).
 - Added `truncate_path` tests incl. multibyte no-panic.
-- (51 tests total, all passing.)
+- TP-4 (CI / static gate): done, see above.
+- (80 tests total, all passing.)

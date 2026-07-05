@@ -83,3 +83,5 @@ Configure your editor command, theme, font size, default excluded directories, a
 ## Developer Guide
 
 Architecture notes, palette/theme conventions, and other decisions not obvious from the code are in [doc/design.md](doc/design.md).
+
+Testing strategy and current test debt/backlog are in [doc/testing.md](doc/testing.md) and [doc/test-plan.md](doc/test-plan.md).
