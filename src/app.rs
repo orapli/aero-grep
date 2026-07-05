@@ -3844,37 +3844,37 @@ impl GrepApp {
                                     file_entries.iter().map(|(p, _)| p.clone()).collect();
                             }
                             ui.separator();
-                            if ui
-                                .add_sized(
-                                    [24.0, 24.0],
-                                    egui::Button::new(icon_rt(
-                                        icons::CHEVRON_RIGHT,
-                                        15.0,
-                                        pal.subtext,
-                                    ))
-                                    .frame(false),
-                                )
-                                .on_hover_text("Collapse all")
-                                .clicked()
-                            {
-                                for (path, _) in &file_entries {
-                                    self.collapsed_files.insert(path.clone());
+                            if matches!(self.view_mode, ViewMode::Tree) {
+                                if ui
+                                    .add_sized(
+                                        [24.0, 24.0],
+                                        egui::Button::new(icon_rt(
+                                            icons::CHEVRON_RIGHT,
+                                            15.0,
+                                            pal.subtext,
+                                        ))
+                                        .frame(false),
+                                    )
+                                    .on_hover_text("Collapse all")
+                                    .clicked()
+                                {
+                                    set_all_tree_dirs_open(ui.ctx(), &file_entries, &base, false);
                                 }
-                            }
-                            if ui
-                                .add_sized(
-                                    [24.0, 24.0],
-                                    egui::Button::new(icon_rt(
-                                        icons::CHEVRON_DOWN,
-                                        15.0,
-                                        pal.subtext,
-                                    ))
-                                    .frame(false),
-                                )
-                                .on_hover_text("Expand all")
-                                .clicked()
-                            {
-                                self.collapsed_files.clear();
+                                if ui
+                                    .add_sized(
+                                        [24.0, 24.0],
+                                        egui::Button::new(icon_rt(
+                                            icons::CHEVRON_DOWN,
+                                            15.0,
+                                            pal.subtext,
+                                        ))
+                                        .frame(false),
+                                    )
+                                    .on_hover_text("Expand all")
+                                    .clicked()
+                                {
+                                    set_all_tree_dirs_open(ui.ctx(), &file_entries, &base, true);
+                                }
                             }
                         }
                         let flat_active = matches!(self.view_mode, ViewMode::Flat);
@@ -4859,7 +4859,6 @@ impl GrepApp {
                         }
                         chevron_resp.on_hover_text("Click to collapse/expand");
 
-                        ui.label(RichText::new("  ").size(13.0).background_color(pal.accent));
                         ui.add_space(4.0);
 
                         let right_reserve = 60.0_f32; // Reserve space for sticky copy button on the right
@@ -7463,6 +7462,57 @@ fn build_flat_tree(
     let mut items = Vec::with_capacity(entries.len());
     flatten(&root, base, base, ctx, 0, &mut items);
     items
+}
+
+/// Force every directory in the Tree view open or closed, for the file
+/// list's "Collapse all" / "Expand all" buttons. Unlike `build_flat_tree`,
+/// this must walk every directory regardless of its current open state —
+/// a closed directory's children are otherwise unreachable.
+fn set_all_tree_dirs_open(
+    ctx: &egui::Context,
+    entries: &[(PathBuf, usize)],
+    base: &Path,
+    open: bool,
+) {
+    use std::collections::BTreeMap;
+    struct Node {
+        dirs: BTreeMap<String, Node>,
+    }
+    impl Node {
+        fn new() -> Self {
+            Self {
+                dirs: BTreeMap::new(),
+            }
+        }
+        fn insert(&mut self, rel: &Path) {
+            let mut comps = rel.components();
+            if let Some(first) = comps.next() {
+                let name = first.as_os_str().to_string_lossy().to_string();
+                let rest: &Path = comps.as_path();
+                if rest != Path::new("") {
+                    self.dirs.entry(name).or_insert_with(Node::new).insert(rest);
+                }
+            }
+        }
+    }
+    fn walk(node: &Node, cur: &Path, ctx: &egui::Context, open: bool) {
+        for (name, child) in &node.dirs {
+            let child_path = cur.join(name);
+            let id = egui::Id::new(&child_path);
+            let mut state =
+                egui::collapsing_header::CollapsingState::load_with_default_open(ctx, id, true);
+            state.set_open(open);
+            state.store(ctx);
+            walk(child, &child_path, ctx, open);
+        }
+    }
+
+    let mut root = Node::new();
+    for (path, _) in entries {
+        let rel = path.strip_prefix(base).unwrap_or(path);
+        root.insert(rel);
+    }
+    walk(&root, base, ctx, open);
 }
 
 // ── Highlighted text ──────────────────────────────────────────────────────────

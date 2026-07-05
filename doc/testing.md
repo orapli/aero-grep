@@ -27,7 +27,9 @@ Run everything with `cargo test`. Tests must pass under parallel execution
 
 ---
 
-## Current inventory (80 tests)
+## Current inventory
+
+Run `cargo test` for the exact count.
 
 - `grep.rs` — search pipeline (literal/regex/case/glob/exclude/default-excludes/
   binary/depth/context/no-match/cancel/multi-root/multibyte), pure helpers
