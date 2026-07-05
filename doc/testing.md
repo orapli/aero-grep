@@ -17,7 +17,7 @@ refactors** — not a coverage percentage. Target total ≈ 20–30 tests.
 
 | Layer | What it covers here | Tooling | Status |
 |-------|---------------------|---------|--------|
-| **Static** | `cargo build`, `clippy -D warnings`, `fmt --check`, the type system | compiler / CI | partial (no CI yet) |
+| **Static** | `cargo build`, `clippy -D warnings`, `fmt --check`, the type system | compiler / CI (`.github/workflows/ci.yml`) | **good** |
 | **Unit** | Pure functions: `build_regex`, `is_excluded`, `matches_glob`, `count_*`, char-boundary helpers, `common_prefix/suffix_len`, `truncate_path`, `short_dir`, `format_ts` | `#[cfg(test)]` in-module | **good** |
 | **Integration** (thickest) | `search()` pipeline over a temp tree, `apply_replace` + `backup_file`, `Config`/`History` serde round-trip & backward-compat | `tempfile` | **good for search/replace; gaps in History & app state** |
 | **E2E** | egui GUI interaction | `egui_kittest` | **deferred — see below** |
@@ -27,7 +27,7 @@ Run everything with `cargo test`. Tests must pass under parallel execution
 
 ---
 
-## Current inventory (51 tests)
+## Current inventory (80 tests)
 
 - `grep.rs` — search pipeline (literal/regex/case/glob/exclude/default-excludes/
   binary/depth/context/no-match/cancel/multi-root/multibyte), pure helpers
@@ -57,8 +57,6 @@ Run everything with `cargo test`. Tests must pass under parallel execution
    (`do_replace_preview` → `do_replace_all` → `execute_replace`) are pure state
    transitions but untested, partly because `GrepApp::new` needs an
    `eframe::CreationContext` and the constructor reads global config from disk.
-
-3. **No CI / static gate.** `clippy -D warnings` and `fmt --check` aren't enforced.
 
 ---
 
