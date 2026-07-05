@@ -7468,7 +7468,12 @@ fn build_flat_tree(
 /// list's "Collapse all" / "Expand all" buttons. Unlike `build_flat_tree`,
 /// this must walk every directory regardless of its current open state —
 /// a closed directory's children are otherwise unreachable.
-fn set_all_tree_dirs_open(ctx: &egui::Context, entries: &[(PathBuf, usize)], base: &Path, open: bool) {
+fn set_all_tree_dirs_open(
+    ctx: &egui::Context,
+    entries: &[(PathBuf, usize)],
+    base: &Path,
+    open: bool,
+) {
     use std::collections::BTreeMap;
     struct Node {
         dirs: BTreeMap<String, Node>,
