@@ -1298,7 +1298,8 @@ impl GrepApp {
             return;
         };
         if !same_search_criteria(&result.params, &self.params) {
-            self.status_msg = "Search criteria changed — run the search again before replacing".to_string();
+            self.status_msg =
+                "Search criteria changed — run the search again before replacing".to_string();
             return;
         }
         let params = replacement_params_for_result(&result.params, &self.params);
@@ -1375,7 +1376,8 @@ impl GrepApp {
             return;
         };
         if !same_search_criteria(&result.params, &self.params) {
-            self.status_msg = "Search criteria changed — run the search again before replacing".to_string();
+            self.status_msg =
+                "Search criteria changed — run the search again before replacing".to_string();
             return;
         }
         let files = self.get_files_to_replace();
@@ -1385,7 +1387,8 @@ impl GrepApp {
         self.replace_confirm_files = files.len();
         self.replace_confirm_matches = crate::grep::count_match_instances(&files);
         self.replace_confirm_snapshot = Some(files);
-        self.replace_confirm_params = Some(replacement_params_for_result(&result.params, &self.params));
+        self.replace_confirm_params =
+            Some(replacement_params_for_result(&result.params, &self.params));
         if self.config.confirm_before_replace {
             self.show_replace_confirm = true;
         } else {
@@ -2190,34 +2193,34 @@ impl eframe::App for GrepApp {
                                         }
                                         if enabled && !tabs_locked {
                                             tab_resp.context_menu(|ui| {
-                                            if ui.button("Close all").clicked() {
-                                                bulk_tab_action = Some(BulkTabAction::All);
-                                                ui.close();
-                                            }
-                                            let has_others = tab_count > 1;
-                                            ui.add_enabled_ui(has_others, |ui| {
-                                                if ui.button("Close others").clicked() {
-                                                    bulk_tab_action =
-                                                        Some(BulkTabAction::Others(i));
+                                                if ui.button("Close all").clicked() {
+                                                    bulk_tab_action = Some(BulkTabAction::All);
                                                     ui.close();
                                                 }
-                                            });
-                                            let has_right = i + 1 < tab_count;
-                                            ui.add_enabled_ui(has_right, |ui| {
-                                                if ui.button("Close to the right").clicked() {
-                                                    bulk_tab_action =
-                                                        Some(BulkTabAction::ToRight(i));
-                                                    ui.close();
-                                                }
-                                            });
-                                            let has_left = i > 0;
-                                            ui.add_enabled_ui(has_left, |ui| {
-                                                if ui.button("Close to the left").clicked() {
-                                                    bulk_tab_action =
-                                                        Some(BulkTabAction::ToLeft(i));
-                                                    ui.close();
-                                                }
-                                            });
+                                                let has_others = tab_count > 1;
+                                                ui.add_enabled_ui(has_others, |ui| {
+                                                    if ui.button("Close others").clicked() {
+                                                        bulk_tab_action =
+                                                            Some(BulkTabAction::Others(i));
+                                                        ui.close();
+                                                    }
+                                                });
+                                                let has_right = i + 1 < tab_count;
+                                                ui.add_enabled_ui(has_right, |ui| {
+                                                    if ui.button("Close to the right").clicked() {
+                                                        bulk_tab_action =
+                                                            Some(BulkTabAction::ToRight(i));
+                                                        ui.close();
+                                                    }
+                                                });
+                                                let has_left = i > 0;
+                                                ui.add_enabled_ui(has_left, |ui| {
+                                                    if ui.button("Close to the left").clicked() {
+                                                        bulk_tab_action =
+                                                            Some(BulkTabAction::ToLeft(i));
+                                                        ui.close();
+                                                    }
+                                                });
                                             });
                                         }
                                     }
@@ -4607,7 +4610,11 @@ impl GrepApp {
             let all_paths: Vec<PathBuf> = result.files.iter().map(|f| f.path.clone()).collect();
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No files selected").color(pal.subtext).size(14.0));
+                    ui.label(
+                        RichText::new("No files selected")
+                            .color(pal.subtext)
+                            .size(14.0),
+                    );
                     ui.add_space(6.0);
                     if ui.button("Select all files").clicked() {
                         self.selected_files = all_paths.iter().cloned().collect();
