@@ -454,22 +454,15 @@ pub fn search(
         anyhow::bail!("Search cancelled");
     }
 
-    let mut files = std::mem::take(&mut *collected.lock().unwrap());
-
-    // Enforce max result files limit
-    let truncated = if config.max_result_files == 0 {
-        false
-    } else {
-        let truncated = files.len() > config.max_result_files;
-        if truncated {
-            files.truncate(config.max_result_files);
-        }
-        truncated
-    };
-    files.sort();
+    // Sort before searching so the result limit is applied to deterministic
+    // matching paths rather than to whichever candidates the parallel walker
+    // happened to yield first. Search results are retained only for one
+    // bounded chunk at a time, then streamed in path order.
+    let mut candidate_paths = std::mem::take(&mut *collected.lock().unwrap());
+    candidate_paths.sort();
 
     // Report total file count so the UI can show a determinate progress bar
-    total.store(files.len(), std::sync::atomic::Ordering::Relaxed);
+    total.store(candidate_paths.len(), std::sync::atomic::Ordering::Relaxed);
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(auto_thread_count())
@@ -484,32 +477,59 @@ pub fn search(
     } else {
         Encoding::new(&config.search_encoding).ok()
     };
-    pool.install(|| {
-        files.par_iter().for_each_with(tx, |sender, path| {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            let result = search_file(
-                path,
-                &matcher,
-                max_size,
-                context,
-                encoding.as_ref(),
-                &cancel,
-            );
-            scanned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(fm) = result {
-                let h: usize = fm
-                    .matches
-                    .iter()
-                    .filter(|m| m.is_match)
-                    .map(|m| m.ranges.len())
-                    .sum();
-                hits.fetch_add(h, std::sync::atomic::Ordering::Relaxed);
-                let _ = sender.send(fm);
-            }
+    const SEARCH_CHUNK_SIZE: usize = 128;
+    let mut returned_files = 0;
+    let mut truncated = false;
+    'search_chunks: for chunk in candidate_paths.chunks(SEARCH_CHUNK_SIZE) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+
+        let mut matching_files: Vec<FileMatch> = pool.install(|| {
+            chunk
+                .par_iter()
+                .filter_map(|path| {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return None;
+                    }
+                    let result = search_file(
+                        path,
+                        &matcher,
+                        max_size,
+                        context,
+                        encoding.as_ref(),
+                        &cancel,
+                    );
+                    scanned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    result
+                })
+                .collect()
         });
-    });
+        matching_files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+
+        for file_match in matching_files {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if config.max_result_files != 0 && returned_files >= config.max_result_files {
+                truncated = true;
+                break 'search_chunks;
+            }
+            let h: usize = file_match
+                .matches
+                .iter()
+                .filter(|m| m.is_match)
+                .map(|m| m.ranges.len())
+                .sum();
+            hits.fetch_add(h, std::sync::atomic::Ordering::Relaxed);
+            returned_files += 1;
+            let _ = tx.send(file_match);
+        }
+    }
+
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        anyhow::bail!("Search cancelled");
+    }
 
     Ok(truncated)
 }
@@ -1044,6 +1064,121 @@ mod tests {
         let (files_unlimited, truncated_unlimited) = run_search(p, cfg_unlimited).unwrap();
         assert_eq!(files_unlimited.len(), 5);
         assert!(!truncated_unlimited);
+    }
+
+    #[test]
+    fn test_result_limit_ignores_nonmatching_candidates() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a-no-match.txt"), "goodbye\n").unwrap();
+        std::fs::write(dir.path().join("b-hit.txt"), "hello\n").unwrap();
+        std::fs::write(dir.path().join("c-hit.txt"), "hello\n").unwrap();
+
+        let mut config = test_config();
+        config.max_result_files = 2;
+        let (files, truncated) =
+            run_search(test_params(dir.path().to_str().unwrap(), "hello"), config).unwrap();
+
+        let names: Vec<_> = files
+            .iter()
+            .map(|file| file.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["b-hit.txt", "c-hit.txt"]);
+        assert!(!truncated, "exactly two files match the configured limit");
+    }
+
+    #[test]
+    fn test_result_limit_returns_deterministic_first_matching_paths() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a-no-match.txt"), "goodbye\n").unwrap();
+        for name in ["b-hit.txt", "c-hit.txt", "d-hit.txt"] {
+            std::fs::write(dir.path().join(name), "hello\n").unwrap();
+        }
+
+        let mut config = test_config();
+        config.max_result_files = 2;
+        let (files, truncated) =
+            run_search(test_params(dir.path().to_str().unwrap(), "hello"), config).unwrap();
+
+        let names: Vec<_> = files
+            .iter()
+            .map(|file| file.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["b-hit.txt", "c-hit.txt"]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_result_limit_finds_matches_after_first_search_chunk() {
+        let dir = tempdir().unwrap();
+        for i in 0..130 {
+            std::fs::write(
+                dir.path().join(format!("a{i:03}-no-match.txt")),
+                "goodbye\n",
+            )
+            .unwrap();
+        }
+        for name in ["b-hit.txt", "c-hit.txt", "d-hit.txt"] {
+            std::fs::write(dir.path().join(name), "hello\n").unwrap();
+        }
+
+        let mut config = test_config();
+        config.max_result_files = 2;
+        let (files, truncated) =
+            run_search(test_params(dir.path().to_str().unwrap(), "hello"), config).unwrap();
+
+        let names: Vec<_> = files
+            .iter()
+            .map(|file| file.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["b-hit.txt", "c-hit.txt"]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_result_limit_exactly_at_chunk_boundary_is_not_truncated() {
+        let dir = tempdir().unwrap();
+        for i in 0..126 {
+            std::fs::write(
+                dir.path().join(format!("a{i:03}-no-match.txt")),
+                "goodbye\n",
+            )
+            .unwrap();
+        }
+        for name in ["m-hit.txt", "n-hit.txt"] {
+            std::fs::write(dir.path().join(name), "hello\n").unwrap();
+        }
+        for name in ["o-no-match.txt", "p-no-match.txt"] {
+            std::fs::write(dir.path().join(name), "goodbye\n").unwrap();
+        }
+
+        let mut config = test_config();
+        config.max_result_files = 2;
+        let (files, truncated) =
+            run_search(test_params(dir.path().to_str().unwrap(), "hello"), config).unwrap();
+
+        let names: Vec<_> = files
+            .iter()
+            .map(|file| file.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["m-hit.txt", "n-hit.txt"]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_unlimited_result_limit_returns_all_matching_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a-no-match.txt"), "goodbye\n").unwrap();
+        for name in ["b-hit.txt", "c-hit.txt", "d-hit.txt"] {
+            std::fs::write(dir.path().join(name), "hello\n").unwrap();
+        }
+
+        let mut config = test_config();
+        config.max_result_files = 0;
+        let (files, truncated) =
+            run_search(test_params(dir.path().to_str().unwrap(), "hello"), config).unwrap();
+
+        assert_eq!(files.len(), 3);
+        assert!(!truncated);
     }
 
     #[test]
