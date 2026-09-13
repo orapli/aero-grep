@@ -266,6 +266,11 @@ pub struct GrepApp {
     next_history_id: u64,
 
     search_state: Arc<Mutex<SearchState>>,
+    /// Parameters sent to the current worker. The toolbar remains editable
+    /// during a search, so completion must use this immutable snapshot.
+    search_execution_params: Option<SearchParams>,
+    /// Tab that owns the current worker's result.
+    search_origin_tab: Option<usize>,
     current_result: Option<SearchResult>,
     tabs: Vec<ResultTab>,
     active_tab: Option<usize>,
@@ -309,6 +314,7 @@ pub struct GrepApp {
     replace_confirm_files: usize,
     replace_confirm_matches: usize,
     replace_confirm_snapshot: Option<Vec<FileMatch>>,
+    replace_confirm_params: Option<SearchParams>,
     show_shortcuts: bool,
     show_reset_settings_confirm: bool,
 
@@ -401,6 +407,8 @@ impl GrepApp {
             history,
             next_history_id,
             search_state: Arc::new(Mutex::new(SearchState::Idle)),
+            search_execution_params: None,
+            search_origin_tab: None,
             current_result: None,
             tabs: Vec::new(),
             active_tab: None,
@@ -426,6 +434,7 @@ impl GrepApp {
             replace_confirm_files: 0,
             replace_confirm_matches: 0,
             replace_confirm_snapshot: None,
+            replace_confirm_params: None,
             show_shortcuts: false,
             show_reset_settings_confirm: false,
             show_restore_backups: false,
@@ -531,6 +540,9 @@ impl GrepApp {
     }
 
     fn switch_to_tab(&mut self, idx: usize) {
+        if self.search_is_in_flight() {
+            return;
+        }
         self.save_active_tab();
         self.current_result = self.tabs[idx].result.clone();
         self.apply_nav_state(load_tab_nav(&self.tabs, idx));
@@ -557,6 +569,9 @@ impl GrepApp {
     }
 
     fn new_empty_tab(&mut self) {
+        if self.search_is_in_flight() {
+            return;
+        }
         self.save_active_tab();
         let tab = ResultTab {
             is_settings: false,
@@ -590,6 +605,9 @@ impl GrepApp {
     }
 
     fn close_tab(&mut self, idx: usize) {
+        if self.search_is_in_flight() {
+            return;
+        }
         if idx >= self.tabs.len() {
             return;
         }
@@ -612,6 +630,9 @@ impl GrepApp {
     /// Close every tab, returning to the empty (no-tab) state — same end state
     /// as closing the last tab one by one.
     fn close_all_tabs(&mut self) {
+        if self.search_is_in_flight() {
+            return;
+        }
         self.tabs.clear();
         self.active_tab = None;
         self.current_result = None;
@@ -621,6 +642,9 @@ impl GrepApp {
 
     /// Close every tab except the one at `keep_idx`, which becomes active.
     fn close_other_tabs(&mut self, keep_idx: usize) {
+        if self.search_is_in_flight() {
+            return;
+        }
         if keep_idx >= self.tabs.len() {
             return;
         }
@@ -634,6 +658,9 @@ impl GrepApp {
 
     /// Close all tabs to the right of `idx`.
     fn close_tabs_to_right(&mut self, idx: usize) {
+        if self.search_is_in_flight() {
+            return;
+        }
         if idx + 1 >= self.tabs.len() {
             return;
         }
@@ -646,6 +673,9 @@ impl GrepApp {
 
     /// Close all tabs to the left of `idx`.
     fn close_tabs_to_left(&mut self, idx: usize) {
+        if self.search_is_in_flight() {
+            return;
+        }
         if idx == 0 || idx > self.tabs.len() {
             return;
         }
@@ -669,6 +699,9 @@ impl GrepApp {
     }
 
     fn open_settings_tab(&mut self) {
+        if self.search_is_in_flight() {
+            return;
+        }
         if let Some(idx) = self.tabs.iter().position(|t| t.is_settings) {
             if self.active_tab != Some(idx) {
                 self.switch_to_tab(idx);
@@ -689,6 +722,9 @@ impl GrepApp {
     }
 
     fn close_settings_tab(&mut self) {
+        if self.search_is_in_flight() {
+            return;
+        }
         if let Some(idx) = self.tabs.iter().position(|t| t.is_settings) {
             self.close_tab(idx);
         }
@@ -706,7 +742,7 @@ impl GrepApp {
         // (often empty) results and leaving the in-flight walk uncancellable.
         // The Search button turns into "Stop", but Enter in the query fields
         // would otherwise bypass that guard. Stop the current search first.
-        if matches!(*self.search_state.lock().unwrap(), SearchState::Running) {
+        if self.search_is_in_flight() {
             return;
         }
         self.last_search_error = None;
@@ -724,7 +760,10 @@ impl GrepApp {
             return;
         }
 
+        let execution_params = self.params.clone();
         self.pending_search_transient = transient;
+        self.search_execution_params = Some(execution_params.clone());
+        self.search_origin_tab = self.active_tab;
 
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.cancel_flag = Some(Arc::clone(&cancel));
@@ -742,7 +781,7 @@ impl GrepApp {
         self.status_msg = "Searching...".to_string();
         self.replace_preview = None;
 
-        let params = self.params.clone();
+        let params = execution_params;
         let config = self.config.clone();
         let state = Arc::clone(&self.search_state);
         let scanned = Arc::clone(&self.search_scanned);
@@ -772,11 +811,22 @@ impl GrepApp {
         });
     }
 
+    fn search_is_in_flight(&self) -> bool {
+        self.search_execution_params.is_some()
+            || matches!(*self.search_state.lock().unwrap(), SearchState::Running)
+    }
+
     fn cancel_search(&mut self) {
         if let Some(cancel) = &self.cancel_flag {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             self.status_msg = "Cancelling...".to_string();
         }
+    }
+
+    fn abort_search(&mut self) {
+        self.incremental_debounce_at = None;
+        self.incremental_restart_pending = false;
+        self.cancel_search();
     }
 
     fn drain_search_rx(&mut self) {
@@ -792,6 +842,10 @@ impl GrepApp {
         // `poll_search` takes `incremental_restart_pending` — set fresh by
         // `start_search` for the search this finalize corresponds to.
         let transient = std::mem::take(&mut self.pending_search_transient);
+        let execution_params = self
+            .search_execution_params
+            .take()
+            .unwrap_or_else(|| self.params.clone());
         // Drain any remaining results from the channel
         if let Some(rx) = self.search_result_rx.take() {
             for fm in rx.try_iter() {
@@ -804,6 +858,7 @@ impl GrepApp {
         let total = count_total_matches(&files);
         let trunc_note = if truncated { " (truncated)" } else { "" };
         if cancelled && files.is_empty() {
+            self.search_origin_tab = None;
             self.status_msg = "Search cancelled".to_string();
             return;
         }
@@ -824,6 +879,10 @@ impl GrepApp {
             )
         };
 
+        let origin = self.search_origin_tab.take();
+        let result_belongs_to_active = result_belongs_to_active_tab(origin, self.active_tab);
+        let previous_nav = self.current_nav_state();
+
         // Clear working set for new results (selected_files was preserved during search)
         self.selected_files.clear();
         self.collapsed_files.clear();
@@ -837,7 +896,7 @@ impl GrepApp {
         self.next_history_id += 1;
         let result = SearchResult {
             id,
-            params: self.params.clone(),
+            params: execution_params,
             timestamp: Local::now().to_rfc3339(),
             duration_ms: ms,
             total_matches: total,
@@ -868,8 +927,16 @@ impl GrepApp {
         };
         self.scroll_to_current = true;
         if !cancelled {
-            self.update_active_tab(result);
+            if result_belongs_to_active {
+                self.update_active_tab(result);
+            } else if let Some(idx) = origin {
+                self.apply_nav_state(previous_nav);
+                if let Some(tab) = self.tabs.get_mut(idx) {
+                    tab.result = Some(result);
+                }
+            }
         } else {
+            self.search_origin_tab = None;
             self.current_result = Some(result);
         }
     }
@@ -916,6 +983,8 @@ impl GrepApp {
             SearchState::Error(e) => {
                 self.search_result_rx = None;
                 self.search_live_files.clear();
+                self.search_execution_params = None;
+                self.search_origin_tab = None;
                 self.status_msg = format!("Error: {}", e);
                 self.last_search_error = Some(e);
             }
@@ -927,6 +996,8 @@ impl GrepApp {
                 // just flash the older results before they're overwritten.
                 self.search_result_rx = None;
                 self.search_live_files.clear();
+                self.search_execution_params = None;
+                self.search_origin_tab = None;
             }
             SearchState::Cancelled => {
                 self.finalize_search(0, false, true);
@@ -956,6 +1027,15 @@ impl GrepApp {
     /// issue asks for, rather than silently ignoring the keystroke (which
     /// `start_search`'s normal re-entrancy guard would otherwise do).
     fn poll_incremental_search(&mut self, ctx: &egui::Context) {
+        if self.show_replace_confirm
+            || self.show_shortcuts
+            || self.replace_preview.is_some()
+            || self.show_reset_settings_confirm
+            || self.show_save_project_popup
+            || self.show_restore_backups
+        {
+            return;
+        }
         if !self.config.incremental_search {
             self.incremental_debounce_at = None;
             return;
@@ -1141,7 +1221,7 @@ impl GrepApp {
                 let result = self.current_result.as_ref()?;
                 let fm = result.files.get(f_idx)?;
                 if &fm.path == path {
-                    fm.matches.get(m_idx).map(|m| m.line_number)
+                    matching_line_number(fm, m_idx)
                 } else {
                     None
                 }
@@ -1158,6 +1238,10 @@ impl GrepApp {
     /// corrupted), fail gracefully with a status message instead of
     /// panicking.
     fn load_history_entry(&mut self, id: u64) {
+        if self.search_is_in_flight() {
+            self.status_msg = "Search is still running — wait for it to finish".to_string();
+            return;
+        }
         let Some(result) = self.history.load_result(id) else {
             self.status_msg = "History snapshot unavailable — try Re-run instead".to_string();
             return;
@@ -1196,16 +1280,29 @@ impl GrepApp {
     /// regardless of whether a snapshot exists — re-scanning reflects the
     /// files as they are *now*, which may differ from the snapshot).
     fn rerun_history_entry(&mut self, entry: &HistoryEntry) {
+        if self.search_is_in_flight() {
+            self.status_msg = "Search is still running — wait for it to finish".to_string();
+            return;
+        }
         self.ensure_empty_tab();
         self.params = entry.params.clone();
         self.start_search(false);
     }
 
     fn do_replace_preview(&mut self) {
+        if self.search_is_in_flight() {
+            self.status_msg = "Search is still running — wait for it to finish".to_string();
+            return;
+        }
         let Some(result) = &self.current_result else {
             return;
         };
-        let files_to_preview: Vec<crate::models::FileMatch> = match self.params.replace_scope {
+        if !same_search_criteria(&result.params, &self.params) {
+            self.status_msg = "Search criteria changed — run the search again before replacing".to_string();
+            return;
+        }
+        let params = replacement_params_for_result(&result.params, &self.params);
+        let files_to_preview: Vec<crate::models::FileMatch> = match params.replace_scope {
             crate::models::ReplaceScope::Selected => result
                 .files
                 .iter()
@@ -1226,14 +1323,13 @@ impl GrepApp {
             return;
         }
 
-        let regex = match build_regex(&self.params) {
+        let regex = match build_regex(&params) {
             Ok(r) => r,
             Err(e) => {
                 self.status_msg = format!("Regex error: {}", e);
                 return;
             }
         };
-        let params = self.params.clone();
         let mut entries: Vec<(PathBuf, String, String)> = Vec::new();
         for fm in &files_to_preview {
             let original = match std::fs::read_to_string(&fm.path) {
@@ -1271,6 +1367,17 @@ impl GrepApp {
     }
 
     fn do_replace_all(&mut self) {
+        if self.search_is_in_flight() {
+            self.status_msg = "Search is still running — wait for it to finish".to_string();
+            return;
+        }
+        let Some(result) = &self.current_result else {
+            return;
+        };
+        if !same_search_criteria(&result.params, &self.params) {
+            self.status_msg = "Search criteria changed — run the search again before replacing".to_string();
+            return;
+        }
         let files = self.get_files_to_replace();
         if files.is_empty() {
             return;
@@ -1278,6 +1385,7 @@ impl GrepApp {
         self.replace_confirm_files = files.len();
         self.replace_confirm_matches = crate::grep::count_match_instances(&files);
         self.replace_confirm_snapshot = Some(files);
+        self.replace_confirm_params = Some(replacement_params_for_result(&result.params, &self.params));
         if self.config.confirm_before_replace {
             self.show_replace_confirm = true;
         } else {
@@ -1286,21 +1394,43 @@ impl GrepApp {
     }
 
     fn execute_replace(&mut self) {
+        if self.search_is_in_flight() {
+            self.status_msg = "Search is still running — wait for it to finish".to_string();
+            self.replace_confirm_snapshot = None;
+            self.replace_confirm_params = None;
+            self.show_replace_confirm = false;
+            return;
+        }
         let Some(files) = self.replace_confirm_snapshot.clone() else {
+            self.replace_confirm_params = None;
             self.show_replace_confirm = false;
             return;
         };
-        let params = self.params.clone();
-
-        if let Ok(regex) = build_regex(&params) {
-            let summary =
-                self.run_and_record_replace(&files, &regex, &params.pattern, &params.replace_text);
-            self.status_msg = format!(
-                "Replaced {} instances in {} files ({} errors)",
-                summary.replaced_instances, summary.ok, summary.err
-            );
+        let Some(params) = self.replace_confirm_params.clone() else {
+            self.replace_confirm_snapshot = None;
+            self.replace_confirm_params = None;
+            self.show_replace_confirm = false;
+            return;
+        };
+        match build_regex(&params) {
+            Ok(regex) => {
+                let summary = self.run_and_record_replace(
+                    &files,
+                    &regex,
+                    &params.pattern,
+                    &params.replace_text,
+                );
+                self.status_msg = format!(
+                    "Replaced {} instances in {} files ({} errors)",
+                    summary.replaced_instances, summary.ok, summary.err
+                );
+            }
+            Err(e) => {
+                self.status_msg = format!("Replace pattern is invalid: {}", e);
+            }
         }
         self.replace_confirm_snapshot = None;
+        self.replace_confirm_params = None;
         self.show_replace_confirm = false;
     }
 
@@ -1712,6 +1842,8 @@ impl eframe::App for GrepApp {
         self.poll_search();
         self.poll_incremental_search(&ctx);
         self.ensure_theme_applied(&ctx);
+        let is_searching = matches!(*self.search_state.lock().unwrap(), SearchState::Running);
+        let tabs_locked = self.search_is_in_flight();
 
         // Disable global shortcuts when any modal/subwindow is open
         let modal_open = self.show_replace_confirm
@@ -1721,6 +1853,8 @@ impl eframe::App for GrepApp {
             || self.show_save_project_popup
             || self.show_restore_backups;
         let enabled = !self.show_replace_confirm
+            && !self.show_shortcuts
+            && self.replace_preview.is_none()
             && !self.show_reset_settings_confirm
             && !self.show_save_project_popup
             && !self.show_restore_backups;
@@ -1760,19 +1894,26 @@ impl eframe::App for GrepApp {
             if i.key_pressed(egui::Key::Escape) {
                 if self.show_palette {
                     close_palette = true;
-                } else {
-                    self.show_history = false;
-                    self.show_shortcuts = false;
+                } else if self.show_replace_confirm {
                     self.show_replace_confirm = false;
                     self.replace_confirm_snapshot = None;
+                    self.replace_confirm_params = None;
+                } else if self.replace_preview.is_some() {
+                    self.replace_preview = None;
+                } else if self.show_reset_settings_confirm {
                     self.show_reset_settings_confirm = false;
+                } else if self.show_save_project_popup {
                     self.show_save_project_popup = false;
+                } else if self.show_restore_backups {
                     self.show_restore_backups = false;
-                    if self.replace_preview.is_some() {
-                        self.replace_preview = None;
-                    } else if self.is_settings_active() {
-                        self.close_settings_tab();
-                    }
+                } else if self.show_shortcuts {
+                    self.show_shortcuts = false;
+                } else if self.show_history {
+                    self.show_history = false;
+                } else if self.is_settings_active() {
+                    self.close_settings_tab();
+                } else if is_searching {
+                    self.abort_search();
                 }
             }
 
@@ -1832,7 +1973,6 @@ impl eframe::App for GrepApp {
             }
         }
 
-        let is_searching = matches!(*self.search_state.lock().unwrap(), SearchState::Running);
         if is_searching {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
@@ -1853,17 +1993,19 @@ impl eframe::App for GrepApp {
         }
 
         // ── OS folder drag-and-drop onto the window ────────────────────────────
-        ctx.input(|i| {
-            if let Some(dropped) = i.raw.dropped_files.first() {
-                let path = dropped
-                    .path
-                    .as_deref()
-                    .map(|p| p.to_string_lossy().into_owned());
-                if let Some(p) = path {
-                    self.params.directory = p;
+        if enabled {
+            ctx.input(|i| {
+                if let Some(dropped) = i.raw.dropped_files.first() {
+                    let path = dropped
+                        .path
+                        .as_deref()
+                        .map(|p| p.to_string_lossy().into_owned());
+                    if let Some(p) = path {
+                        self.params.directory = p;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         let pal = self.pal;
 
@@ -1924,7 +2066,7 @@ impl eframe::App for GrepApp {
                 .min_size(220.0)
                 .frame(egui::Frame::NONE.fill(pal.bg_mantle))
                 .show_inside(ui, |ui| {
-                    ui.add_enabled_ui(enabled, |ui| {
+                    ui.add_enabled_ui(enabled && !tabs_locked, |ui| {
                         self.show_history_panel(ui);
                     });
                 });
@@ -2036,7 +2178,7 @@ impl eframe::App for GrepApp {
                                             .interact(egui::Sense::click())
                                             .on_hover_text(tooltip)
                                             .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                        if tab_resp.clicked() {
+                                        if enabled && !tabs_locked && tab_resp.clicked() {
                                             let on_close = tab_resp
                                                 .interact_pointer_pos()
                                                 .is_some_and(|p| close_rect.contains(p));
@@ -2046,7 +2188,8 @@ impl eframe::App for GrepApp {
                                                 tab_switch = Some(i);
                                             }
                                         }
-                                        tab_resp.context_menu(|ui| {
+                                        if enabled && !tabs_locked {
+                                            tab_resp.context_menu(|ui| {
                                             if ui.button("Close all").clicked() {
                                                 bulk_tab_action = Some(BulkTabAction::All);
                                                 ui.close();
@@ -2075,11 +2218,13 @@ impl eframe::App for GrepApp {
                                                     ui.close();
                                                 }
                                             });
-                                        });
+                                            });
+                                        }
                                     }
                                     ui.add_space(4.0);
                                     if ui
-                                        .add(
+                                        .add_enabled(
+                                            enabled && !tabs_locked,
                                             egui::Button::new(icon_rt(
                                                 icons::ADD,
                                                 13.0,
@@ -2099,28 +2244,34 @@ impl eframe::App for GrepApp {
                     // Fixed icon cluster: Settings + History (always at right of tab bar)
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                        self.icon_toggle(ui, "show_settings", icons::SETTINGS, "Settings");
+                        ui.add_enabled_ui(enabled && !tabs_locked, |ui| {
+                            self.icon_toggle(ui, "show_settings", icons::SETTINGS, "Settings");
+                        });
                         // Off mode (#24) records nothing, so hide the toggle
                         // entirely rather than show an always-empty panel.
                         if self.config.history_mode != HistoryMode::Off {
-                            self.icon_toggle(ui, "show_history", icons::HISTORY, "History");
+                            ui.add_enabled_ui(enabled && !tabs_locked, |ui| {
+                                self.icon_toggle(ui, "show_history", icons::HISTORY, "History");
+                            });
                         }
                     });
                 });
             });
-        if let Some(action) = bulk_tab_action {
-            match action {
-                BulkTabAction::All => self.close_all_tabs(),
-                BulkTabAction::Others(i) => self.close_other_tabs(i),
-                BulkTabAction::ToRight(i) => self.close_tabs_to_right(i),
-                BulkTabAction::ToLeft(i) => self.close_tabs_to_left(i),
+        if enabled && !tabs_locked {
+            if let Some(action) = bulk_tab_action {
+                match action {
+                    BulkTabAction::All => self.close_all_tabs(),
+                    BulkTabAction::Others(i) => self.close_other_tabs(i),
+                    BulkTabAction::ToRight(i) => self.close_tabs_to_right(i),
+                    BulkTabAction::ToLeft(i) => self.close_tabs_to_left(i),
+                }
+            } else if let Some(i) = tab_close {
+                self.close_tab(i);
+            } else if let Some(i) = tab_switch {
+                self.switch_to_tab(i);
+            } else if add_new_tab {
+                self.new_empty_tab();
             }
-        } else if let Some(i) = tab_close {
-            self.close_tab(i);
-        } else if let Some(i) = tab_switch {
-            self.switch_to_tab(i);
-        } else if add_new_tab {
-            self.new_empty_tab();
         }
 
         let settings_active = self.is_settings_active();
@@ -2274,9 +2425,7 @@ impl eframe::App for GrepApp {
                 .max_width(max_w)
                 .max_height(max_h)
                 .show(&ctx, |ui| {
-                    ui.add_enabled_ui(enabled, |ui| {
-                        self.show_replace_preview_window(ui);
-                    });
+                    self.show_replace_preview_window(ui);
                 });
         }
 
@@ -3054,7 +3203,7 @@ impl GrepApp {
                 .clicked()
             {
                 if is_searching {
-                    self.cancel_search();
+                    self.abort_search();
                 } else {
                     self.start_search(false);
                 }
@@ -3648,6 +3797,7 @@ impl GrepApp {
 
     fn show_replace_bar(&mut self, ui: &mut Ui) {
         let pal = self.pal;
+        let search_in_flight = self.search_is_in_flight();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
 
@@ -3722,9 +3872,20 @@ impl GrepApp {
                     .as_ref()
                     .is_some_and(|r| !r.files.is_empty())
             };
-            let preview_ready =
-                preview_has_targets && has_result && !self.params.pattern.is_empty();
-            let preview_tip = if is_selected_scope {
+            let criteria_match = self
+                .current_result
+                .as_ref()
+                .is_some_and(|r| same_search_criteria(&r.params, &self.params));
+            let preview_ready = preview_has_targets
+                && has_result
+                && !self.params.pattern.is_empty()
+                && criteria_match
+                && !search_in_flight;
+            let preview_tip = if search_in_flight {
+                "Search is still running — wait for it to finish"
+            } else if has_result && !criteria_match {
+                "Search criteria changed — run the search again before replacing"
+            } else if is_selected_scope {
                 "Preview replacement for selected files"
             } else {
                 "Preview replacement for all matched files (up to 20)"
@@ -3736,14 +3897,25 @@ impl GrepApp {
                     egui::Button::new(RichText::new("Preview").color(pal.text).size(12.0)),
                 )
                 .on_hover_text(preview_tip)
+                .on_disabled_hover_text(preview_tip)
                 .clicked()
             {
                 self.do_replace_preview();
             }
 
             let files_to_replace = self.get_files_to_replace();
-            let replace_ready =
-                has_result && !self.params.pattern.is_empty() && !files_to_replace.is_empty();
+            let replace_ready = has_result
+                && !self.params.pattern.is_empty()
+                && !files_to_replace.is_empty()
+                && criteria_match
+                && !search_in_flight;
+            let replace_tip = if search_in_flight {
+                "Search is still running — wait for it to finish"
+            } else if has_result && !criteria_match {
+                "Search criteria changed — run the search again before replacing"
+            } else {
+                "Apply replacement to the selected scope"
+            };
 
             if ui
                 .add_enabled(
@@ -3751,7 +3923,8 @@ impl GrepApp {
                     egui::Button::new(RichText::new("Replace").color(pal.bg_mantle).size(12.0))
                         .fill(pal.red),
                 )
-                .on_hover_text("Apply replacement to the selected scope")
+                .on_hover_text(replace_tip)
+                .on_disabled_hover_text(replace_tip)
                 .clicked()
             {
                 self.do_replace_all();
@@ -4015,7 +4188,12 @@ impl GrepApp {
         if all_file_count == 0 {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("No results yet").color(pal.muted).size(13.0));
+                let message = if self.current_result.is_some() {
+                    "No matches found"
+                } else {
+                    "Run a search to see matching files"
+                };
+                ui.label(RichText::new(message).color(pal.subtext).size(13.0));
             });
             return;
         }
@@ -4025,9 +4203,12 @@ impl GrepApp {
             ui.vertical_centered(|ui| {
                 ui.label(
                     RichText::new("No files match filter")
-                        .color(pal.muted)
+                        .color(pal.subtext)
                         .size(12.0),
                 );
+                if ui.button("Clear file filter").clicked() {
+                    self.file_filter.clear();
+                }
             });
             return;
         }
@@ -4279,6 +4460,16 @@ impl GrepApp {
         }
 
         if self.current_result.is_none() {
+            if self.search_is_in_flight() {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Searching…").color(pal.subtext).size(14.0));
+                    });
+                });
+                return;
+            }
             // No search has been run yet — show a hero / onboarding card.
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
@@ -4297,7 +4488,7 @@ impl GrepApp {
                     );
                     ui.add_space(28.0);
 
-                    let shortcut_color = pal.muted;
+                    let shortcut_color = pal.subtext;
                     let key_color = pal.accent;
                     let desc_color = pal.text;
 
@@ -4335,19 +4526,17 @@ impl GrepApp {
                                     .color(shortcut_color)
                                     .size(11.0),
                             );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Focus pattern").clicked() {
+                                    self.focus_pattern = true;
+                                }
+                                if ui.button("Focus directory").clicked() {
+                                    self.focus_dir = true;
+                                }
+                            });
                         });
                 });
-            });
-            return;
-        }
-
-        if self.selected_files.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    RichText::new("Select files from the list to view matches")
-                        .color(pal.muted)
-                        .size(14.0),
-                );
             });
             return;
         }
@@ -4355,6 +4544,49 @@ impl GrepApp {
         let Some(result) = &self.current_result else {
             return;
         };
+
+        if result.files.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("No matches found")
+                            .color(pal.subtext)
+                            .strong()
+                            .size(16.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Check the pattern, directory, and filters, then search again.")
+                            .color(pal.subtext)
+                            .size(12.0),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Focus pattern").clicked() {
+                            self.focus_pattern = true;
+                        }
+                        if ui.button("Focus directory").clicked() {
+                            self.focus_dir = true;
+                        }
+                    });
+                });
+            });
+            return;
+        }
+
+        if self.selected_files.is_empty() {
+            let all_paths: Vec<PathBuf> = result.files.iter().map(|f| f.path.clone()).collect();
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No files selected").color(pal.subtext).size(14.0));
+                    ui.add_space(6.0);
+                    if ui.button("Select all files").clicked() {
+                        self.selected_files = all_paths.iter().cloned().collect();
+                    }
+                });
+            });
+            return;
+        }
 
         let mut copy_all_req = false;
         let mut save_to_history_req = false;
@@ -4779,6 +5011,24 @@ impl GrepApp {
                     items.push(RenderItem::MatchLine { fm, lm, is_current });
                 }
             }
+        }
+
+        if items.is_empty() && has_content_filter {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("No lines match the content filter")
+                            .color(pal.subtext)
+                            .size(14.0),
+                    );
+                    ui.add_space(6.0);
+                    if ui.button("Clear content filter").clicked() {
+                        self.content_filter.clear();
+                    }
+                });
+            });
+            self.scroll_to_file = None;
+            return;
         }
 
         let mut copy_text: Option<String> = None;
@@ -7156,6 +7406,7 @@ impl GrepApp {
                     .clicked()
                 {
                     self.replace_confirm_snapshot = None;
+                    self.replace_confirm_params = None;
                     self.show_replace_confirm = false;
                 }
             });
@@ -7975,6 +8226,38 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     haystack
         .windows(needle.len())
         .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn same_search_criteria(a: &SearchParams, b: &SearchParams) -> bool {
+    a.pattern == b.pattern
+        && a.directory == b.directory
+        && a.is_regex == b.is_regex
+        && a.case_sensitive == b.case_sensitive
+        && a.file_glob == b.file_glob
+        && a.context_lines == b.context_lines
+        && a.exclude_glob == b.exclude_glob
+        && a.max_depth == b.max_depth
+        && a.word_boundary == b.word_boundary
+        && a.roots == b.roots
+}
+
+fn result_belongs_to_active_tab(origin: Option<usize>, active: Option<usize>) -> bool {
+    origin.is_none() || origin == active
+}
+
+fn replacement_params_for_result(result: &SearchParams, draft: &SearchParams) -> SearchParams {
+    let mut params = result.clone();
+    params.replace_text = draft.replace_text.clone();
+    params.replace_scope = draft.replace_scope;
+    params
+}
+
+fn matching_line_number(file: &FileMatch, match_idx: usize) -> Option<usize> {
+    file.matches
+        .iter()
+        .filter(|line| line.is_match)
+        .nth(match_idx)
+        .map(|line| line.line_number)
 }
 
 /// Candidate (file_idx, match_idx) pairs for F3/Shift+F3 navigation
@@ -9125,6 +9408,91 @@ mod tests {
         }
     }
 
+    fn test_app() -> GrepApp {
+        let mut config = Config::default();
+        config.history_mode = HistoryMode::Off;
+        config.confirm_before_replace = true;
+        config.backup_before_replace = false;
+        GrepApp {
+            params: SearchParams::default(),
+            history: History::load(0),
+            next_history_id: 1,
+            search_state: Arc::new(Mutex::new(SearchState::Idle)),
+            search_execution_params: None,
+            search_origin_tab: None,
+            current_result: None,
+            tabs: Vec::new(),
+            active_tab: None,
+            cancel_flag: None,
+            incremental_debounce_at: None,
+            incremental_restart_pending: false,
+            pending_search_transient: false,
+            selected_files: BTreeSet::new(),
+            collapsed_files: BTreeSet::new(),
+            view_mode: ViewMode::Tree,
+            file_filter: String::new(),
+            content_filter: String::new(),
+            show_history: false,
+            show_replace: false,
+            show_palette: false,
+            palette_query: String::new(),
+            palette_selected: 0,
+            palette_focus: false,
+            palette_instance: 0,
+            replace_preview: None,
+            replace_preview_excluded: BTreeSet::new(),
+            show_replace_confirm: false,
+            replace_confirm_files: 0,
+            replace_confirm_matches: 0,
+            replace_confirm_snapshot: None,
+            replace_confirm_params: None,
+            show_shortcuts: false,
+            show_reset_settings_confirm: false,
+            show_restore_backups: false,
+            restore_sessions: Vec::new(),
+            restore_selected_session: None,
+            restore_excluded_files: BTreeSet::new(),
+            restore_status: None,
+            focused_pane: FocusedPane::FileList,
+            current_match: None,
+            scroll_to_current: false,
+            scroll_to_file: None,
+            pal: Pal::dark(),
+            tok: Tok::new(),
+            applied_theme: Theme::Dark,
+            applied_font_size: config.font_size,
+            applied_font_path: String::new(),
+            config,
+            status_msg: String::new(),
+            copied_flash: None,
+            copied_file_flash: None,
+            history_saved_flash: None,
+            last_saved_history_id: None,
+            focus_pattern: false,
+            focus_dir: false,
+            pat_suppress_popup_open: false,
+            dir_suggest_idx: None,
+            pat_suggest_idx: None,
+            inc_suggest_idx: None,
+            exc_suggest_idx: None,
+            history_filter: String::new(),
+            settings_tab: 0,
+            search_scanned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            search_hits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            search_total: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            search_result_rx: None,
+            search_live_files: Vec::new(),
+            preset_new_name: String::new(),
+            preset_new_glob: String::new(),
+            editing_preset_idx: None,
+            dnd_hovered_preset_idx: None,
+            last_search_error: None,
+            show_save_project_popup: false,
+            project_new_name: String::new(),
+            focus_project_name: false,
+        }
+    }
+
     fn sample_result() -> SearchResult {
         SearchResult {
             id: 1,
@@ -9505,5 +9873,183 @@ mod tests {
         let formatted_omit = format_matches_to_string_impl(&config, &[&fm1], &params);
         let expected_omit = "  - 1: fn foo()";
         assert_eq!(formatted_omit, expected_omit);
+    }
+
+    #[test]
+    fn test_same_search_criteria_ignores_replace_choices() {
+        let mut a = SearchParams {
+            pattern: "needle".into(),
+            directory: "/repo".into(),
+            ..SearchParams::default()
+        };
+        let mut b = a.clone();
+        b.replace_text = "replacement".into();
+        b.replace_scope = crate::models::ReplaceScope::All;
+        assert!(same_search_criteria(&a, &b));
+
+        a.pattern = "different".into();
+        assert!(!same_search_criteria(&a, &b));
+    }
+
+    #[test]
+    fn test_replacement_snapshot_preserves_result_criteria() {
+        let result = SearchParams {
+            pattern: "needle".into(),
+            directory: "/repo".into(),
+            is_regex: true,
+            case_sensitive: true,
+            file_glob: "*.rs".into(),
+            exclude_glob: "target".into(),
+            context_lines: 2,
+            max_depth: Some(4),
+            word_boundary: true,
+            roots: vec!["/shared".into()],
+            ..SearchParams::default()
+        };
+        let draft = SearchParams {
+            replace_text: "replacement".into(),
+            replace_scope: crate::models::ReplaceScope::All,
+            pattern: "edited pattern".into(),
+            directory: "/other".into(),
+            ..SearchParams::default()
+        };
+        let snapshot = replacement_params_for_result(&result, &draft);
+        assert_eq!(snapshot.pattern, result.pattern);
+        assert_eq!(snapshot.directory, result.directory);
+        assert_eq!(snapshot.file_glob, result.file_glob);
+        assert_eq!(snapshot.roots, result.roots);
+        assert_eq!(snapshot.replace_text, "replacement");
+        assert_eq!(snapshot.replace_scope, crate::models::ReplaceScope::All);
+        assert!(same_search_criteria(&snapshot, &result));
+    }
+
+    #[test]
+    fn test_result_tab_ownership_rejects_changed_active_tab() {
+        assert!(result_belongs_to_active_tab(Some(2), Some(2)));
+        assert!(!result_belongs_to_active_tab(Some(2), Some(1)));
+        // A search started before the first result tab exists may create the
+        // first result tab on completion.
+        assert!(result_belongs_to_active_tab(None, Some(0)));
+    }
+
+    #[test]
+    fn test_finalize_uses_worker_params_after_toolbar_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let execution = SearchParams {
+            pattern: "frozen".into(),
+            directory: dir.path().to_string_lossy().into_owned(),
+            ..SearchParams::default()
+        };
+        let mut app = test_app();
+        app.params = SearchParams {
+            pattern: "edited".into(),
+            directory: dir.path().to_string_lossy().into_owned(),
+            ..SearchParams::default()
+        };
+        app.search_execution_params = Some(execution.clone());
+        app.search_live_files = vec![FileMatch {
+            path: dir.path().join("a.txt"),
+            matches: vec![make_line(1, "frozen", true)],
+        }];
+        app.finalize_search(4, false, false);
+        assert_eq!(app.current_result.unwrap().params, execution);
+    }
+
+    #[test]
+    fn test_tab_mutations_are_locked_until_search_is_finalized() {
+        let mut app = test_app();
+        app.tabs = vec![plain_tab(TabNavState::default())];
+        app.active_tab = Some(0);
+        app.search_execution_params = Some(SearchParams::default());
+        *app.search_state.lock().unwrap() = SearchState::Done(0, false);
+
+        app.new_empty_tab();
+        app.switch_to_tab(0);
+        app.close_tab(0);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, Some(0));
+    }
+
+    #[test]
+    fn test_confirmation_executes_frozen_replacement_after_toolbar_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "foo foo").unwrap();
+        let search_params = SearchParams {
+            pattern: "foo".into(),
+            directory: dir.path().to_string_lossy().into_owned(),
+            ..SearchParams::default()
+        };
+        let mut app = test_app();
+        app.params = SearchParams {
+            replace_text: "bar".into(),
+            ..search_params.clone()
+        };
+        app.current_result = Some(SearchResult {
+            id: 1,
+            params: search_params,
+            files: vec![fm_for(&file)],
+            timestamp: String::new(),
+            duration_ms: 0,
+            total_matches: 2,
+            truncated: false,
+        });
+        app.selected_files.insert(file.clone());
+        app.do_replace_all();
+        assert!(app.show_replace_confirm);
+        app.params.replace_text = "wrong".into();
+        app.execute_replace();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "bar bar");
+    }
+
+    #[test]
+    fn test_replace_rejects_stale_result_criteria() {
+        let mut app = test_app();
+        app.current_result = Some(SearchResult {
+            id: 1,
+            params: SearchParams {
+                pattern: "old".into(),
+                directory: "/repo".into(),
+                ..SearchParams::default()
+            },
+            files: vec![],
+            timestamp: String::new(),
+            duration_ms: 0,
+            total_matches: 0,
+            truncated: false,
+        });
+        app.params = SearchParams {
+            pattern: "new".into(),
+            directory: "/repo".into(),
+            ..SearchParams::default()
+        };
+        app.do_replace_all();
+        assert!(app.replace_confirm_snapshot.is_none());
+        assert!(app.status_msg.contains("run the search again"));
+    }
+
+    #[test]
+    fn test_incremental_search_waits_while_modal_is_open() {
+        let mut app = test_app();
+        app.show_shortcuts = true;
+        app.incremental_debounce_at = Some(Instant::now() - std::time::Duration::from_secs(1));
+        app.poll_incremental_search(&egui::Context::default());
+        assert!(app.incremental_debounce_at.is_some());
+    }
+
+    #[test]
+    fn test_matching_line_number_skips_context_lines() {
+        let file = FileMatch {
+            path: PathBuf::from("/repo/a.txt"),
+            matches: vec![
+                make_line(4, "context", false),
+                make_line(5, "first", true),
+                make_line(6, "context", false),
+                make_line(9, "second", true),
+            ],
+        };
+        assert_eq!(matching_line_number(&file, 0), Some(5));
+        assert_eq!(matching_line_number(&file, 1), Some(9));
+        assert_eq!(matching_line_number(&file, 2), None);
     }
 }
