@@ -4547,29 +4547,58 @@ impl GrepApp {
 
         if result.files.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new("No matches found")
-                            .color(pal.subtext)
-                            .strong()
-                            .size(16.0),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Check the pattern, directory, and filters, then search again.")
-                            .color(pal.subtext)
-                            .size(12.0),
-                    );
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Focus pattern").clicked() {
-                            self.focus_pattern = true;
-                        }
-                        if ui.button("Focus directory").clicked() {
-                            self.focus_dir = true;
-                        }
-                    });
-                });
+                let card_width = ui.available_width().min(460.0);
+                let card_height = 150.0;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(card_width, card_height),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        egui::Frame::NONE
+                            .fill(pal.bg_surface0)
+                            .stroke(Stroke::new(1.0, pal.bg_surface1))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(Margin::symmetric(20, 16))
+                            .show(ui, |ui| {
+                                ui.set_width((card_width - 40.0).max(0.0));
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        RichText::new("No matches found")
+                                            .color(pal.text)
+                                            .strong()
+                                            .size(16.0),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "Check the pattern, directory, and filters, then search again.",
+                                        )
+                                        .color(pal.subtext)
+                                        .size(12.0),
+                                    );
+                                    ui.add_space(10.0);
+                                    if card_width < 300.0 {
+                                        ui.vertical_centered(|ui| {
+                                            if ui.button("Focus pattern").clicked() {
+                                                self.focus_pattern = true;
+                                            }
+                                            if ui.button("Focus directory").clicked() {
+                                                self.focus_dir = true;
+                                            }
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Focus pattern").clicked() {
+                                                self.focus_pattern = true;
+                                            }
+                                            if ui.button("Focus directory").clicked() {
+                                                self.focus_dir = true;
+                                            }
+                                        });
+                                    }
+                                });
+                            });
+                    },
+                );
             });
             return;
         }
@@ -9409,13 +9438,15 @@ mod tests {
     }
 
     fn test_app() -> GrepApp {
-        let mut config = Config::default();
-        config.history_mode = HistoryMode::Off;
-        config.confirm_before_replace = true;
-        config.backup_before_replace = false;
+        let config = Config {
+            history_mode: HistoryMode::Off,
+            confirm_before_replace: true,
+            backup_before_replace: false,
+            ..Config::default()
+        };
         GrepApp {
             params: SearchParams::default(),
-            history: History::load(0),
+            history: History::new_in_memory(0),
             next_history_id: 1,
             search_state: Arc::new(Mutex::new(SearchState::Idle)),
             search_execution_params: None,

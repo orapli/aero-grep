@@ -48,6 +48,16 @@ impl History {
         history
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_in_memory(limit: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            limit,
+            index_path: None,
+            results_dir: None,
+        }
+    }
+
     /// Deletes any `history_results/<id>.json` whose id is not present in
     /// the loaded index — defensive cleanup (e.g. after a crash mid-write,
     /// or a manually edited history.json). Best-effort; errors are ignored.
