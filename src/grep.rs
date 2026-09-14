@@ -1951,15 +1951,25 @@ mod tests {
     #[test]
     fn test_manifest_write_failure_is_returned() {
         let dir = tempdir().unwrap();
-        let root_file = dir.path().join("backup-root");
-        std::fs::write(&root_file, "not a directory").unwrap();
+        let session_dir = dir.path().join("session");
+        let manifest_path = session_dir.join("manifest.json");
+        std::fs::create_dir_all(&manifest_path).unwrap();
         let manifest = ReplaceSessionManifest {
             timestamp: "session".to_string(),
             pattern: "foo".to_string(),
             replace_text: "bar".to_string(),
             files: vec![],
         };
-        assert!(write_session_manifest(&root_file, "session", &manifest).is_err());
+        assert!(write_session_manifest(dir.path(), "session", &manifest).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(&session_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                name.to_string_lossy()
+                    .contains("manifest.json.aero-grep-tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty());
     }
 
     #[test]
