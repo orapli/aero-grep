@@ -10,8 +10,29 @@ use ignore::WalkState;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[derive(Debug)]
+struct ReplacementConflict(PathBuf);
+
+impl std::fmt::Display for ReplacementConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "File changed since replacement snapshot: {}",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for ReplacementConflict {}
+
+pub fn is_replacement_conflict(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ReplacementConflict>().is_some()
+}
 
 /// Single source of truth for search parallelism: always the logical CPU
 /// count (#29 dropped the manual thread-cap setting since it never beat
@@ -534,18 +555,149 @@ pub fn search(
     Ok(truncated)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacementSnapshot {
+    pub path: PathBuf,
+    pub original: Vec<u8>,
+}
+
+pub fn snapshot_file(path: &Path) -> Result<ReplacementSnapshot> {
+    let original =
+        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(ReplacementSnapshot {
+        path: path.to_path_buf(),
+        original,
+    })
+}
+
+pub fn apply_replace_snapshot(
+    snapshot: &ReplacementSnapshot,
+    regex: &Regex,
+    replace_text: &str,
+) -> Result<(String, usize)> {
+    let content = std::str::from_utf8(&snapshot.original).map_err(|_| {
+        anyhow::anyhow!("Cannot replace non-UTF-8 file {}", snapshot.path.display())
+    })?;
+    let count = regex.find_iter(content).count();
+    Ok((regex.replace_all(content, replace_text).into_owned(), count))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn apply_replace(
     file_match: &FileMatch,
     regex: &Regex,
     replace_text: &str,
 ) -> Result<(String, usize)> {
-    let content = std::fs::read_to_string(&file_match.path)
-        .with_context(|| format!("Failed to read {}", file_match.path.display()))?;
-    let count = regex.find_iter(&content).count();
-    Ok((
-        regex.replace_all(&content, replace_text).into_owned(),
-        count,
+    apply_replace_snapshot(&snapshot_file(&file_match.path)?, regex, replace_text)
+}
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn temp_path_for(path: &Path, attempt: u32) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".{name}.aero-grep-tmp-{}-{counter}-{attempt}",
+        std::process::id()
     ))
+}
+
+fn copy_permissions(source: &Path, destination: &Path) -> Result<()> {
+    let permissions = std::fs::metadata(source)?.permissions();
+    std::fs::set_permissions(destination, permissions)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn atomic_rename(temp: &Path, target: &Path) -> Result<()> {
+    std::fs::rename(temp, target)
+        .with_context(|| format!("Failed to atomically replace {}", target.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_rename(temp: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to atomically replace {}", target.display()));
+    }
+    Ok(())
+}
+
+/// Atomically replaces `target` after confirming it still contains `expected`.
+/// The target is never removed before the replacement is ready.
+pub fn atomic_replace(target: &Path, expected: &[u8], replacement: &[u8]) -> Result<()> {
+    // Resolve symlinks before constructing the sibling temporary path. A
+    // rename over the link itself would otherwise disconnect the link rather
+    // than update the file it references, unlike the old direct write path.
+    let target = target
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve {}", target.display()))?;
+    let current = std::fs::read(&target)
+        .with_context(|| format!("Failed to read {} before replacement", target.display()))?;
+    if current != expected {
+        return Err(anyhow::Error::new(ReplacementConflict(target)));
+    }
+    let (mut file, temp_path) = (0..16)
+        .find_map(|attempt| {
+            let candidate = temp_path_for(&target, attempt);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => Some(Ok((file, candidate))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unable to create temporary file beside {}",
+                target.display()
+            )
+        })??;
+    let result = (|| {
+        file.write_all(replacement).with_context(|| {
+            format!(
+                "Failed to write temporary replacement for {}",
+                target.display()
+            )
+        })?;
+        file.flush()?;
+        copy_permissions(&target, &temp_path)
+            .with_context(|| format!("Failed to preserve permissions for {}", target.display()))?;
+        file.sync_all()?;
+        drop(file);
+        let current = std::fs::read(&target).with_context(|| {
+            format!("Failed to recheck {} before replacement", target.display())
+        })?;
+        if current != expected {
+            return Err(anyhow::Error::new(ReplacementConflict(target.clone())));
+        }
+        atomic_rename(&temp_path, &target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 pub fn count_total_matches(files: &[FileMatch]) -> usize {
@@ -555,6 +707,7 @@ pub fn count_total_matches(files: &[FileMatch]) -> usize {
         .sum()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn count_match_instances(files: &[FileMatch]) -> usize {
     files
         .iter()
@@ -582,15 +735,39 @@ fn make_path_safe_under_dir(path: &Path) -> PathBuf {
     safe_path
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn backup_file_to(path: &Path, backup_root: &Path, session_dir_name: &str) -> Result<()> {
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    backup_snapshot_to(&snapshot_file(path)?, backup_root, session_dir_name)
+}
+
+/// Stores the validated snapshot bytes and verifies the copy before the
+/// caller commits the replacement. A failed or partial backup is removed.
+pub fn backup_snapshot_to(
+    snapshot: &ReplacementSnapshot,
+    backup_root: &Path,
+    session_dir_name: &str,
+) -> Result<()> {
+    let canonical_path = snapshot
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| snapshot.path.clone());
     let dest_dir = backup_root.join(session_dir_name);
     let dest_path = dest_dir.join(make_path_safe_under_dir(&canonical_path));
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(path, dest_path)?;
-    Ok(())
+    let result = (|| {
+        atomic_write_new_file(&dest_path, &snapshot.original)?;
+        let written = std::fs::read(&dest_path)?;
+        if written != snapshot.original {
+            anyhow::bail!("Backup verification failed for {}", snapshot.path.display());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&dest_path);
+    }
+    result
 }
 
 /// Returns a session directory name unique under `backup_root`, based on
@@ -646,8 +823,48 @@ pub fn write_session_manifest(
         std::fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(manifest)?;
-    std::fs::write(path, data)?;
-    Ok(())
+    atomic_write_new_file(&path, data.as_bytes())
+}
+
+fn atomic_write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut temp_path = None;
+    let mut file = None;
+    for attempt in 0..16 {
+        let candidate = temp_path_for(path, attempt);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(opened) => {
+                temp_path = Some(candidate);
+                file = Some(opened);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let Some(temp_path) = temp_path else {
+        anyhow::bail!("Unable to create temporary file beside {}", path.display());
+    };
+    let mut file = file.expect("temporary file is present with its path");
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        if path.exists() {
+            atomic_rename(&temp_path, path)?;
+        } else {
+            std::fs::rename(&temp_path, path)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// Lists past replace sessions that have a manifest, newest first (session
@@ -1732,6 +1949,20 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_write_failure_is_returned() {
+        let dir = tempdir().unwrap();
+        let root_file = dir.path().join("backup-root");
+        std::fs::write(&root_file, "not a directory").unwrap();
+        let manifest = ReplaceSessionManifest {
+            timestamp: "session".to_string(),
+            pattern: "foo".to_string(),
+            replace_text: "bar".to_string(),
+            files: vec![],
+        };
+        assert!(write_session_manifest(&root_file, "session", &manifest).is_err());
+    }
+
+    #[test]
     fn test_list_replace_sessions_sorted_newest_first() {
         let dir = tempdir().unwrap();
         let backup_root = dir.path().join("backups");
@@ -1835,6 +2066,35 @@ mod tests {
         let (result, count) = apply_replace(&fm, &re, "bar").unwrap();
         assert_eq!(result, "bar bar bar");
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_apply_replace_snapshot_rejects_non_utf8() {
+        let snapshot = ReplacementSnapshot {
+            path: PathBuf::from("binary.dat"),
+            original: vec![0xff, 0xfe],
+        };
+        let error = apply_replace_snapshot(&snapshot, &Regex::new("foo").unwrap(), "bar")
+            .expect_err("non-UTF-8 replacement must be explicit");
+        assert!(error.to_string().contains("non-UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_replace_follows_symlink_target() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        std::fs::write(&target, "foo").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        atomic_replace(&link, b"foo", b"bar").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "bar");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

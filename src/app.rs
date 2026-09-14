@@ -1,5 +1,8 @@
 use crate::config::{Config, EditorPreset, HistoryMode, Project, Theme};
-use crate::grep::{apply_replace, build_regex, count_total_matches, search};
+use crate::grep::{
+    apply_replace_snapshot, build_regex, count_total_matches, search, snapshot_file,
+    ReplacementSnapshot,
+};
 use crate::history::History;
 use crate::models::{
     FileMatch, HistoryEntry, LineMatch, MatchRange, SearchParams, SearchResult, ViewMode,
@@ -15,7 +18,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-type ReplacePreview = Option<(crate::models::SearchParams, Vec<(PathBuf, String, String)>)>;
+#[derive(Clone)]
+struct ReplacePreviewEntry {
+    snapshot: ReplacementSnapshot,
+    original: String,
+    preview: String,
+}
+
+type ReplacePreview = Option<(crate::models::SearchParams, Vec<ReplacePreviewEntry>)>;
 
 // ── Color palette ─────────────────────────────────────────────────────────────
 // All Color32 fields are Copy, so Pal is Copy too.
@@ -313,7 +323,7 @@ pub struct GrepApp {
     show_replace_confirm: bool,
     replace_confirm_files: usize,
     replace_confirm_matches: usize,
-    replace_confirm_snapshot: Option<Vec<FileMatch>>,
+    replace_confirm_snapshot: Option<Vec<ReplacementSnapshot>>,
     replace_confirm_params: Option<SearchParams>,
     show_shortcuts: bool,
     show_reset_settings_confirm: bool,
@@ -1331,17 +1341,28 @@ impl GrepApp {
                 return;
             }
         };
-        let mut entries: Vec<(PathBuf, String, String)> = Vec::new();
+        let mut entries: Vec<ReplacePreviewEntry> = Vec::new();
         for fm in &files_to_preview {
-            let original = match std::fs::read_to_string(&fm.path) {
-                Ok(s) => s,
+            let snapshot = match snapshot_file(&fm.path) {
+                Ok(snapshot) => snapshot,
                 Err(e) => {
                     self.status_msg = format!("Read error: {}", e);
                     return;
                 }
             };
-            match apply_replace(fm, &regex, &params.replace_text) {
-                Ok((preview, _)) => entries.push((fm.path.clone(), original, preview)),
+            match apply_replace_snapshot(&snapshot, &regex, &params.replace_text) {
+                Ok((preview, _)) => match String::from_utf8(snapshot.original.clone()) {
+                    Ok(original) => entries.push(ReplacePreviewEntry {
+                        snapshot,
+                        original,
+                        preview,
+                    }),
+                    Err(_) => {
+                        self.status_msg =
+                            format!("Cannot replace non-UTF-8 file {}", fm.path.display());
+                        return;
+                    }
+                },
                 Err(e) => {
                     self.status_msg = format!("Preview error: {}", e);
                     return;
@@ -1380,15 +1401,44 @@ impl GrepApp {
                 "Search criteria changed — run the search again before replacing".to_string();
             return;
         }
-        let files = self.get_files_to_replace();
-        if files.is_empty() {
+        let file_matches = self.get_files_to_replace();
+        if file_matches.is_empty() {
             return;
         }
+        let params = replacement_params_for_result(&result.params, &self.params);
+        let regex = match build_regex(&params) {
+            Ok(regex) => regex,
+            Err(e) => {
+                self.status_msg = format!("Replace pattern is invalid: {}", e);
+                return;
+            }
+        };
+        let mut files = Vec::with_capacity(file_matches.len());
+        for fm in &file_matches {
+            let snapshot = match snapshot_file(&fm.path) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    self.status_msg = format!("Read error: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) = apply_replace_snapshot(&snapshot, &regex, &params.replace_text) {
+                self.status_msg = format!("Replace error: {}", e);
+                return;
+            }
+            files.push(snapshot);
+        }
         self.replace_confirm_files = files.len();
-        self.replace_confirm_matches = crate::grep::count_match_instances(&files);
+        self.replace_confirm_matches = files
+            .iter()
+            .filter_map(|snapshot| {
+                apply_replace_snapshot(snapshot, &regex, &params.replace_text)
+                    .ok()
+                    .map(|(_, count)| count)
+            })
+            .sum();
         self.replace_confirm_snapshot = Some(files);
-        self.replace_confirm_params =
-            Some(replacement_params_for_result(&result.params, &self.params));
+        self.replace_confirm_params = Some(params);
         if self.config.confirm_before_replace {
             self.show_replace_confirm = true;
         } else {
@@ -1423,10 +1473,7 @@ impl GrepApp {
                     &params.pattern,
                     &params.replace_text,
                 );
-                self.status_msg = format!(
-                    "Replaced {} instances in {} files ({} errors)",
-                    summary.replaced_instances, summary.ok, summary.err
-                );
+                self.status_msg = format_replace_status(&summary);
             }
             Err(e) => {
                 self.status_msg = format!("Replace pattern is invalid: {}", e);
@@ -1444,7 +1491,7 @@ impl GrepApp {
     /// "Replace Selected" action so both are equally undo-able.
     fn run_and_record_replace(
         &mut self,
-        files: &[FileMatch],
+        files: &[ReplacementSnapshot],
         regex: &Regex,
         pattern: &str,
         replace_text: &str,
@@ -1455,7 +1502,7 @@ impl GrepApp {
         // session dir (which would overwrite each other's manifest/backups).
         let session_dir_name =
             crate::grep::unique_session_dir_name(&backup_root, chrono::Local::now());
-        let summary = run_replace_all(
+        let mut summary = run_replace_all(
             files,
             regex,
             replace_text,
@@ -1470,7 +1517,14 @@ impl GrepApp {
                 replace_text: replace_text.to_string(),
                 files: summary.replaced_files.clone(),
             };
-            let _ = crate::grep::write_session_manifest(&backup_root, &session_dir_name, &manifest);
+            if let Err(error) =
+                crate::grep::write_session_manifest(&backup_root, &session_dir_name, &manifest)
+            {
+                summary.manifest_error = Some(format!(
+                    "{error}; backups remain recoverable under {}",
+                    backup_root.join(&session_dir_name).display()
+                ));
+            }
         }
         summary
     }
@@ -1498,8 +1552,12 @@ impl GrepApp {
 struct ReplaceSummary {
     ok: usize,
     err: usize,
+    conflicts: usize,
+    conflict_files: Vec<PathBuf>,
+    error_files: Vec<(PathBuf, String)>,
     replaced_instances: usize,
     replaced_files: Vec<PathBuf>,
+    manifest_error: Option<String>,
 }
 
 /// Pure orchestration of a Replace-All run over `files`: for each file,
@@ -1510,7 +1568,7 @@ struct ReplaceSummary {
 /// string). `apply_replace`/`backup_file_to` themselves are already tested
 /// in `grep.rs`; this covers the per-file loop + counting around them.
 fn run_replace_all(
-    files: &[FileMatch],
+    files: &[ReplacementSnapshot],
     regex: &Regex,
     replace_text: &str,
     backup_before_replace: bool,
@@ -1518,28 +1576,111 @@ fn run_replace_all(
     session_dir_name: &str,
 ) -> ReplaceSummary {
     let mut summary = ReplaceSummary::default();
-    for fm in files {
-        if backup_before_replace
-            && crate::grep::backup_file_to(&fm.path, backup_root, session_dir_name).is_err()
-        {
-            summary.err += 1;
+    for snapshot in files {
+        let current = match std::fs::read(&snapshot.path) {
+            Ok(current) => current,
+            Err(error) => {
+                summary.err += 1;
+                summary
+                    .error_files
+                    .push((snapshot.path.clone(), error.to_string()));
+                continue;
+            }
+        };
+        if current != snapshot.original {
+            summary.conflicts += 1;
+            summary.conflict_files.push(snapshot.path.clone());
             continue;
         }
 
-        match apply_replace(fm, regex, replace_text) {
+        if backup_before_replace {
+            if let Err(error) =
+                crate::grep::backup_snapshot_to(snapshot, backup_root, session_dir_name)
+            {
+                summary.err += 1;
+                summary
+                    .error_files
+                    .push((snapshot.path.clone(), format!("backup failed: {error}")));
+                continue;
+            }
+        }
+
+        match apply_replace_snapshot(snapshot, regex, replace_text) {
             Ok((new_content, actual_count)) => {
-                if std::fs::write(&fm.path, new_content).is_ok() {
-                    summary.ok += 1;
-                    summary.replaced_instances += actual_count;
-                    summary.replaced_files.push(fm.path.clone());
-                } else {
-                    summary.err += 1;
+                match crate::grep::atomic_replace(
+                    &snapshot.path,
+                    &snapshot.original,
+                    new_content.as_bytes(),
+                ) {
+                    Ok(()) => {
+                        summary.ok += 1;
+                        summary.replaced_instances += actual_count;
+                        summary.replaced_files.push(snapshot.path.clone());
+                    }
+                    Err(error) if crate::grep::is_replacement_conflict(&error) => {
+                        summary.conflicts += 1;
+                        summary.conflict_files.push(snapshot.path.clone());
+                    }
+                    Err(error) => {
+                        summary.err += 1;
+                        summary
+                            .error_files
+                            .push((snapshot.path.clone(), error.to_string()));
+                    }
                 }
             }
-            Err(_) => summary.err += 1,
+            Err(error) => {
+                summary.err += 1;
+                summary
+                    .error_files
+                    .push((snapshot.path.clone(), error.to_string()));
+            }
         }
     }
     summary
+}
+
+fn format_replace_status(summary: &ReplaceSummary) -> String {
+    let conflict_detail = if summary.conflict_files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; conflicts: {}",
+            summary
+                .conflict_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let error_detail = if summary.error_files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; errors: {}",
+            summary
+                .error_files
+                .iter()
+                .map(|(path, reason)| format!("{} ({reason})", path.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "Replaced {} instances in {} files ({} conflicts, {} errors{}{}{})",
+        summary.replaced_instances,
+        summary.ok,
+        summary.conflicts,
+        summary.err,
+        conflict_detail,
+        error_detail,
+        summary
+            .manifest_error
+            .as_deref()
+            .map(|e| format!(", restore metadata failed: {e}"))
+            .unwrap_or_default()
+    )
 }
 
 fn format_global_header(config: &Config, params: &crate::models::SearchParams) -> String {
@@ -7105,9 +7246,9 @@ impl GrepApp {
         let total_files = entries.len();
         let total_changed_lines: usize = entries
             .iter()
-            .map(|(_, orig, prev)| {
-                let ol: Vec<&str> = orig.lines().collect();
-                let pl: Vec<&str> = prev.lines().collect();
+            .map(|entry| {
+                let ol: Vec<&str> = entry.original.lines().collect();
+                let pl: Vec<&str> = entry.preview.lines().collect();
                 (0..ol.len().max(pl.len()))
                     .filter(|&i| {
                         ol.get(i).copied().unwrap_or("") != pl.get(i).copied().unwrap_or("")
@@ -7135,7 +7276,10 @@ impl GrepApp {
         let regex = build_regex(&params).ok();
 
         ScrollArea::both().id_salt("replace_diff").show(ui, |ui| {
-            for (file_idx, (path, original, preview)) in entries.iter().enumerate() {
+            for (file_idx, entry) in entries.iter().enumerate() {
+                let path = &entry.snapshot.path;
+                let original = &entry.original;
+                let preview = &entry.preview;
                 if file_idx > 0 {
                     ui.add_space(8.0);
                 }
@@ -7335,13 +7479,10 @@ impl GrepApp {
             }
         });
 
-        let selected_files: Vec<FileMatch> = entries
+        let selected_files: Vec<ReplacementSnapshot> = entries
             .iter()
-            .filter(|(path, _, _)| !self.replace_preview_excluded.contains(path))
-            .map(|(path, _, _)| FileMatch {
-                path: path.clone(),
-                matches: vec![],
-            })
+            .filter(|entry| !self.replace_preview_excluded.contains(&entry.snapshot.path))
+            .map(|entry| entry.snapshot.clone())
             .collect();
 
         ui.separator();
@@ -7367,10 +7508,7 @@ impl GrepApp {
                         &params.pattern,
                         &params.replace_text,
                     );
-                    self.status_msg = format!(
-                        "Replaced {} instances in {} files ({} errors)",
-                        summary.replaced_instances, summary.ok, summary.err
-                    );
+                    self.status_msg = format_replace_status(&summary);
                 }
                 self.replace_preview = None;
             }
@@ -8977,6 +9115,8 @@ fn format_session_timestamp(session_dir_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     // #33: same-second replace session collisions — format_session_timestamp
     // disambiguates a unique_session_dir_name-suffixed name in the Restore
@@ -9216,6 +9356,10 @@ mod tests {
         }
     }
 
+    fn snapshot_for(path: &Path) -> ReplacementSnapshot {
+        snapshot_file(path).unwrap()
+    }
+
     #[test]
     fn test_run_replace_all_backs_up_before_writing() {
         let src_dir = tempfile::tempdir().unwrap();
@@ -9224,7 +9368,7 @@ mod tests {
         std::fs::write(&file, "foo123").unwrap();
 
         let summary = run_replace_all(
-            &[fm_for(&file)],
+            &[snapshot_for(&file)],
             &replace_regex("foo"),
             "bar",
             true,
@@ -9237,8 +9381,12 @@ mod tests {
             ReplaceSummary {
                 ok: 1,
                 err: 0,
+                conflicts: 0,
+                conflict_files: vec![],
+                error_files: vec![],
                 replaced_instances: 1,
                 replaced_files: vec![file.clone()],
+                manifest_error: None,
             }
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "bar123");
@@ -9264,7 +9412,7 @@ mod tests {
         std::fs::write(&file, "foo123").unwrap();
 
         let summary = run_replace_all(
-            &[fm_for(&file)],
+            &[snapshot_for(&file)],
             &replace_regex("foo"),
             "bar",
             false,
@@ -9282,28 +9430,32 @@ mod tests {
     #[test]
     fn test_run_replace_all_skips_file_on_backup_failure() {
         let src_dir = tempfile::tempdir().unwrap();
-        let backup_dir = tempfile::tempdir().unwrap();
-        // Points at a file that was never created, so backup_file_to's
-        // fs::copy (source doesn't exist) fails deterministically.
-        let missing = src_dir.path().join("missing.txt");
+        let backup_dir = src_dir.path().join("backup-root");
+        std::fs::write(&backup_dir, "not a directory").unwrap();
+        let file = src_dir.path().join("source.txt");
+        std::fs::write(&file, "foo").unwrap();
 
         let summary = run_replace_all(
-            &[fm_for(&missing)],
+            &[ReplacementSnapshot {
+                path: file.clone(),
+                original: b"foo".to_vec(),
+            }],
             &replace_regex("foo"),
             "bar",
             true,
-            backup_dir.path(),
+            &backup_dir,
             "session1",
         );
 
+        assert_eq!(summary.ok, 0);
+        assert_eq!(summary.err, 1);
+        assert_eq!(summary.conflicts, 0);
+        assert_eq!(summary.conflict_files, Vec::<PathBuf>::new());
+        assert_eq!(summary.error_files.len(), 1);
+        assert_eq!(summary.error_files[0].0, file);
         assert_eq!(
-            summary,
-            ReplaceSummary {
-                ok: 0,
-                err: 1,
-                replaced_instances: 0,
-                replaced_files: vec![],
-            }
+            std::fs::read_to_string(src_dir.path().join("source.txt")).unwrap(),
+            "foo"
         );
     }
 
@@ -9315,7 +9467,10 @@ mod tests {
         let missing = src_dir.path().join("missing.txt");
 
         let summary = run_replace_all(
-            &[fm_for(&missing)],
+            &[ReplacementSnapshot {
+                path: missing.clone(),
+                original: Vec::new(),
+            }],
             &replace_regex("foo"),
             "bar",
             false,
@@ -9323,15 +9478,12 @@ mod tests {
             "session1",
         );
 
-        assert_eq!(
-            summary,
-            ReplaceSummary {
-                ok: 0,
-                err: 1,
-                replaced_instances: 0,
-                replaced_files: vec![],
-            }
-        );
+        assert_eq!(summary.ok, 0);
+        assert_eq!(summary.err, 1);
+        assert_eq!(summary.conflicts, 0);
+        assert_eq!(summary.conflict_files, Vec::<PathBuf>::new());
+        assert_eq!(summary.error_files.len(), 1);
+        assert_eq!(summary.error_files[0].0, missing);
     }
 
     #[test]
@@ -9344,7 +9496,7 @@ mod tests {
         std::fs::write(&file2, "foo").unwrap(); // 1 match
 
         let summary = run_replace_all(
-            &[fm_for(&file1), fm_for(&file2)],
+            &[snapshot_for(&file1), snapshot_for(&file2)],
             &replace_regex("foo"),
             "bar",
             false,
@@ -9358,6 +9510,122 @@ mod tests {
         assert_eq!(summary.replaced_files, vec![file1.clone(), file2.clone()]);
         assert_eq!(std::fs::read_to_string(&file1).unwrap(), "bar bar");
         assert_eq!(std::fs::read_to_string(&file2).unwrap(), "bar");
+    }
+
+    #[test]
+    fn test_run_replace_all_refuses_external_edit_without_mutation() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let file = src_dir.path().join("a.txt");
+        std::fs::write(&file, "foo").unwrap();
+        let snapshot = snapshot_for(&file);
+        std::fs::write(&file, "external").unwrap();
+
+        let summary = run_replace_all(
+            &[snapshot],
+            &replace_regex("foo"),
+            "bar",
+            false,
+            backup_dir.path(),
+            "session1",
+        );
+
+        assert_eq!(summary.ok, 0);
+        assert_eq!(summary.conflicts, 1);
+        assert_eq!(summary.conflict_files, vec![file.clone()]);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "external");
+    }
+
+    #[test]
+    fn test_external_edit_is_refused_before_backup_creation() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let file = src_dir.path().join("a.txt");
+        std::fs::write(&file, "foo").unwrap();
+        let snapshot = snapshot_for(&file);
+        std::fs::write(&file, "external").unwrap();
+
+        let summary = run_replace_all(
+            &[snapshot],
+            &replace_regex("foo"),
+            "bar",
+            true,
+            backup_dir.path(),
+            "session1",
+        );
+
+        assert_eq!(summary.conflicts, 1);
+        assert!(!backup_dir.path().join("session1").exists());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "external");
+    }
+
+    #[test]
+    fn test_atomic_replace_preserves_permissions_and_cleans_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "foo").unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let mode_before = std::fs::metadata(&file).unwrap().permissions();
+        crate::grep::atomic_replace(&file, b"foo", b"bar").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"bar");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode(),
+            mode_before.mode()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains("a.txt.aero-grep-tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn test_run_replace_all_reports_partial_conflicts_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, "foo").unwrap();
+        std::fs::write(&second, "foo").unwrap();
+        let first_snapshot = snapshot_for(&first);
+        let second_snapshot = snapshot_for(&second);
+        std::fs::write(&second, "changed").unwrap();
+
+        let summary = run_replace_all(
+            &[first_snapshot, second_snapshot],
+            &replace_regex("foo"),
+            "bar",
+            false,
+            backup.path(),
+            "session1",
+        );
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.conflicts, 1);
+        assert_eq!(summary.err, 0);
+        assert_eq!(summary.conflict_files, vec![second.clone()]);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "bar");
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "changed");
+    }
+
+    #[test]
+    fn test_replace_status_surfaces_manifest_failure_and_backup_location() {
+        let summary = ReplaceSummary {
+            ok: 1,
+            replaced_instances: 1,
+            replaced_files: vec![PathBuf::from("a.txt")],
+            manifest_error: Some(
+                "permission denied; backups remain recoverable under /tmp/session".to_string(),
+            ),
+            ..ReplaceSummary::default()
+        };
+        let status = format_replace_status(&summary);
+        assert!(status.contains("restore metadata failed"));
+        assert!(status.contains("/tmp/session"));
     }
 
     // #24: history recording mode
@@ -10038,6 +10306,81 @@ mod tests {
         app.params.replace_text = "wrong".into();
         app.execute_replace();
         assert_eq!(std::fs::read_to_string(file).unwrap(), "bar bar");
+    }
+
+    #[test]
+    fn test_confirmation_refuses_external_edit_without_mutating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "foo").unwrap();
+        let search_params = SearchParams {
+            pattern: "foo".into(),
+            directory: dir.path().to_string_lossy().into_owned(),
+            ..SearchParams::default()
+        };
+        let mut app = test_app();
+        app.params = SearchParams {
+            replace_text: "bar".into(),
+            ..search_params.clone()
+        };
+        app.current_result = Some(SearchResult {
+            id: 1,
+            params: search_params,
+            files: vec![fm_for(&file)],
+            timestamp: String::new(),
+            duration_ms: 0,
+            total_matches: 1,
+            truncated: false,
+        });
+        app.selected_files.insert(file.clone());
+        app.do_replace_all();
+        assert!(app.show_replace_confirm);
+        std::fs::write(&file, "external").unwrap();
+        app.execute_replace();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "external");
+        assert!(app.status_msg.contains("conflicts"));
+    }
+
+    #[test]
+    fn test_preview_snapshot_refuses_external_edit_without_mutating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "foo").unwrap();
+        let search_params = SearchParams {
+            pattern: "foo".into(),
+            directory: dir.path().to_string_lossy().into_owned(),
+            ..SearchParams::default()
+        };
+        let mut app = test_app();
+        app.params = SearchParams {
+            replace_text: "bar".into(),
+            ..search_params.clone()
+        };
+        app.current_result = Some(SearchResult {
+            id: 1,
+            params: search_params,
+            files: vec![fm_for(&file)],
+            timestamp: String::new(),
+            duration_ms: 0,
+            total_matches: 1,
+            truncated: false,
+        });
+        app.selected_files.insert(file.clone());
+        app.do_replace_preview();
+        let (params, entries) = app.replace_preview.clone().unwrap();
+        std::fs::write(&file, "external").unwrap();
+        let snapshots: Vec<_> = entries.into_iter().map(|entry| entry.snapshot).collect();
+        let summary = run_replace_all(
+            &snapshots,
+            &build_regex(&params).unwrap(),
+            &params.replace_text,
+            false,
+            backup_dir.path(),
+            "session1",
+        );
+        assert_eq!(summary.conflicts, 1);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "external");
     }
 
     #[test]
