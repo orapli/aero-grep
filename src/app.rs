@@ -2268,7 +2268,7 @@ impl eframe::App for GrepApp {
                                         let mut close_rect = egui::Rect::NOTHING;
                                         let frame_resp = egui::Frame::NONE
                                             .fill(bg)
-                                            .stroke(Stroke::new(1.0, border))
+                                            .stroke(Stroke::new(1.0_f32, border))
                                             .corner_radius(rounding)
                                             .inner_margin(Margin {
                                                 left: 8,
@@ -2879,7 +2879,7 @@ impl GrepApp {
                 egui::Frame::NONE
                     .fill(frame_fill)
                     .corner_radius(egui::CornerRadius::same(8))
-                    .stroke(egui::Stroke::new(1.0, border_col))
+                    .stroke(egui::Stroke::new(1.0_f32, border_col))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.set_width(win_w - 16.0);
@@ -3169,7 +3169,7 @@ impl GrepApp {
                 let popup_frame = egui::Frame::popup(ui.style())
                     .fill(pal.bg_surface0)
                     .corner_radius(egui::CornerRadius::same(6))
-                    .stroke(egui::Stroke::new(1.0, pal.bg_surface1))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.bg_surface1))
                     .inner_margin(Margin::same(4));
                 egui::Popup::from_response(dr)
                     .id(dir_popup_id)
@@ -3391,7 +3391,7 @@ impl GrepApp {
                 let popup_frame = egui::Frame::popup(ui.style())
                     .fill(pal.bg_surface0)
                     .corner_radius(egui::CornerRadius::same(6))
-                    .stroke(egui::Stroke::new(1.0, pal.bg_surface1))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.bg_surface1))
                     .inner_margin(Margin::same(4));
                 egui::Popup::from_response(pr)
                     .id(pat_popup_id)
@@ -3645,7 +3645,7 @@ impl GrepApp {
                 let popup_frame = egui::Frame::popup(ui.style())
                     .fill(pal.bg_surface0)
                     .corner_radius(egui::CornerRadius::same(6))
-                    .stroke(egui::Stroke::new(1.0, pal.bg_surface1))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.bg_surface1))
                     .inner_margin(Margin::same(4));
                 egui::Popup::from_response(ir)
                     .id(inc_popup_id)
@@ -3719,7 +3719,7 @@ impl GrepApp {
                 let popup_frame = egui::Frame::popup(ui.style())
                     .fill(pal.bg_surface0)
                     .corner_radius(egui::CornerRadius::same(6))
-                    .stroke(egui::Stroke::new(1.0, pal.bg_surface1))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.bg_surface1))
                     .inner_margin(Margin::same(4));
                 egui::Popup::from_response(er)
                     .id(exc_popup_id)
@@ -4326,7 +4326,7 @@ impl GrepApp {
         ui.painter().hline(
             ui.available_rect_before_wrap().x_range(),
             ui.cursor().top(),
-            Stroke::new(1.0, pal.bg_surface0),
+            Stroke::new(1.0_f32, pal.bg_surface0),
         );
 
         if all_file_count == 0 {
@@ -4582,7 +4582,7 @@ impl GrepApp {
             ui.centered_and_justified(|ui| {
                 egui::Frame::NONE
                     .fill(pal.bg_surface0)
-                    .stroke(egui::Stroke::new(1.0, pal.red))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.red))
                     .inner_margin(Margin::same(16))
                     .corner_radius(egui::CornerRadius::same(6))
                     .show(ui, |ui| {
@@ -4699,7 +4699,7 @@ impl GrepApp {
                     |ui| {
                         egui::Frame::NONE
                             .fill(pal.bg_surface0)
-                            .stroke(Stroke::new(1.0, pal.bg_surface1))
+                            .stroke(Stroke::new(1.0_f32, pal.bg_surface1))
                             .corner_radius(egui::CornerRadius::same(8))
                             .inner_margin(Margin::symmetric(20, 16))
                             .show(ui, |ui| {
@@ -5059,7 +5059,7 @@ impl GrepApp {
         ui.painter().hline(
             ui.available_rect_before_wrap().x_range(),
             ui.cursor().top(),
-            Stroke::new(1.0, pal.bg_surface0),
+            Stroke::new(1.0_f32, pal.bg_surface0),
         );
         ui.add_space(1.0);
 
@@ -5372,7 +5372,7 @@ impl GrepApp {
                     ui.painter().hline(
                         egui::Rangef::new(rect.left() + 53.0, rect.right()),
                         top + 4.0,
-                        Stroke::new(1.0, pal.bg_surface0),
+                        Stroke::new(1.0_f32, pal.bg_surface0),
                     );
                     ui.add_space(8.0);
                 }
@@ -5440,7 +5440,7 @@ impl GrepApp {
                                 ui.painter().hline(
                                     egui::Rangef::new(r.left(), r.right()),
                                     r.bottom() - 1.0,
-                                    Stroke::new(1.0, ln_color),
+                                    Stroke::new(1.0_f32, ln_color),
                                 );
                             }
                             let gutter = gutter.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -5451,7 +5451,7 @@ impl GrepApp {
                             ui.painter().vline(
                                 r.left(),
                                 egui::Rangef::new(r.top(), r.bottom()),
-                                Stroke::new(1.0, pal.bg_surface0),
+                                Stroke::new(1.0_f32, pal.bg_surface0),
                             );
                             ui.add_space(8.0);
 
@@ -5673,7 +5673,7 @@ impl GrepApp {
                         ui.painter().hline(
                             ui.available_rect_before_wrap().x_range(),
                             ui.cursor().top(),
-                            Stroke::new(1.0, pal.bg_surface0),
+                            Stroke::new(1.0_f32, pal.bg_surface0),
                         );
                     }
 
@@ -6309,13 +6309,13 @@ impl GrepApp {
                                         // Hovered: keep normal appearance; insert line is
                                         // drawn separately below the drop zone call.
                                         if is_this_row_dragged {
-                                            card_frame = card_frame
-                                                .fill(pal.bg_surface0)
-                                                .stroke(egui::Stroke::new(1.0, pal.bg_surface1));
+                                            card_frame = card_frame.fill(pal.bg_surface0).stroke(
+                                                egui::Stroke::new(1.0_f32, pal.bg_surface1),
+                                            );
                                         } else {
-                                            card_frame = card_frame
-                                                .fill(pal.bg_mantle)
-                                                .stroke(egui::Stroke::new(1.0, pal.bg_surface0));
+                                            card_frame = card_frame.fill(pal.bg_mantle).stroke(
+                                                egui::Stroke::new(1.0_f32, pal.bg_surface0),
+                                            );
                                         }
 
                                         let (inner, dropped_payload) = ui
@@ -6605,7 +6605,7 @@ impl GrepApp {
                                             ui.painter().hline(
                                                 r.x_range(),
                                                 r.top(),
-                                                egui::Stroke::new(2.0, pal.accent),
+                                                egui::Stroke::new(2.0_f32, pal.accent),
                                             );
                                         }
 
@@ -6630,7 +6630,7 @@ impl GrepApp {
                                         let glob = &self.config.presets[i].glob;
                                         egui::Frame::window(ui.style())
                                             .fill(pal.bg_surface0)
-                                            .stroke(egui::Stroke::new(1.0, pal.accent))
+                                            .stroke(egui::Stroke::new(1.0_f32, pal.accent))
                                             .corner_radius(egui::CornerRadius::same(4))
                                             .inner_margin(Margin {
                                                 left: 8,
@@ -7305,7 +7305,7 @@ impl GrepApp {
                 ui.painter().hline(
                     ui.available_rect_before_wrap().x_range(),
                     ui.cursor().top(),
-                    Stroke::new(1.0, pal.bg_surface0),
+                    Stroke::new(1.0_f32, pal.bg_surface0),
                 );
 
                 let orig_lines: Vec<&str> = original.lines().collect();
@@ -8157,40 +8157,40 @@ fn apply_theme(ctx: &egui::Context, pal: Pal, tok: Tok) {
     v.faint_bg_color = pal.bg_mantle;
     v.extreme_bg_color = pal.bg_mantle;
     v.code_bg_color = pal.bg_surface0;
-    v.window_stroke = Stroke::new(1.0, pal.bg_surface0);
+    v.window_stroke = Stroke::new(1.0_f32, pal.bg_surface0);
     v.window_corner_radius = egui::CornerRadius::same(tok.r_lg as u8);
 
     v.widgets.noninteractive.bg_fill = pal.bg_base;
     v.widgets.noninteractive.weak_bg_fill = pal.bg_mantle;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.bg_surface0);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.subtext);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal.bg_surface0);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, pal.subtext);
     v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(tok.r_md as u8);
 
     v.widgets.inactive.bg_fill = pal.bg_surface0;
     v.widgets.inactive.weak_bg_fill = pal.bg_surface0;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.bg_surface1);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, pal.text);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.bg_surface1);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text);
     v.widgets.inactive.corner_radius = egui::CornerRadius::same(tok.r_md as u8);
 
     v.widgets.hovered.bg_fill = pal.bg_surface1;
     v.widgets.hovered.weak_bg_fill = pal.bg_surface1;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.5, pal.accent);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, pal.text);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.5_f32, pal.accent);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, pal.text);
     v.widgets.hovered.corner_radius = egui::CornerRadius::same(tok.r_md as u8);
 
     v.widgets.active.bg_fill = pal.bg_overlay0;
     v.widgets.active.weak_bg_fill = pal.bg_overlay0;
-    v.widgets.active.bg_stroke = Stroke::new(1.5, pal.accent);
-    v.widgets.active.fg_stroke = Stroke::new(1.5, pal.accent);
+    v.widgets.active.bg_stroke = Stroke::new(1.5_f32, pal.accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.5_f32, pal.accent);
     v.widgets.active.corner_radius = egui::CornerRadius::same(tok.r_md as u8);
 
     v.widgets.open.bg_fill = pal.bg_surface0;
-    v.widgets.open.fg_stroke = Stroke::new(1.0, pal.accent);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, pal.accent);
     v.widgets.open.corner_radius = egui::CornerRadius::same(tok.r_md as u8);
 
     v.selection.bg_fill =
         Color32::from_rgba_unmultiplied(pal.accent.r(), pal.accent.g(), pal.accent.b(), 45);
-    v.selection.stroke = Stroke::new(1.0, pal.accent);
+    v.selection.stroke = Stroke::new(1.0_f32, pal.accent);
     v.override_text_color = Some(pal.text);
 
     ctx.set_visuals(v);
